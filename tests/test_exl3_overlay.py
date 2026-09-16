@@ -957,7 +957,7 @@ def _grouped_env(cap: int):
     }
 
 
-def _real_expert_layer(device, n_exp: int = 3, cap: int = 32):
+def _real_expert_layer(device, n_exp: int = 3, cap: int = 32, layer_idx: int = 3):
     """Layer built from real checkpoint expert tensors (layer 3, experts 0..n).
 
     Uses the head node's HF cache when mounted; returns None otherwise.
@@ -978,7 +978,7 @@ def _real_expert_layer(device, n_exp: int = 3, cap: int = 32):
     index_path = snaps[0]
     root = index_path.rsplit("/", 1)[0]
     wmap = json.load(open(index_path))["weight_map"]
-    prefix = "model.language_model.layers.3.mlp.experts"
+    prefix = f"model.language_model.layers.{int(layer_idx)}.mlp.experts"
     tensors = {}
     files = {}
     for e in range(n_exp):
@@ -1090,6 +1090,29 @@ def _check_grouped_fat(device) -> None:
         assert diag["grouped_scratch_bytes"] > 0 and diag["grouped_eligible"] and diag["sym_fat_moe"]
         assert diag["effective_tier"] == "grouped" and diag["configured_tier"] == "grouped"
 
+        # Fused load_stage vs gather: h2 must be bit-identical (temp 0).
+        os.environ["GLM53_E3_KEEP_GATHER"] = "1"
+        _FAT_GROUPED_CACHE.clear()
+        y_keep = apply_exl3_experts(x, ids, w, layer, fused=True)
+        keep_scratch = next(v for k, v in _FAT_GROUPED_CACHE.items() if k[-1] == 1)
+        assert "h13" in keep_scratch
+        h2_keep = keep_scratch["h2"].clone()
+        os.environ["GLM53_E3_KEEP_GATHER"] = "0"
+        _FAT_GROUPED_CACHE.clear()
+        y_fuse = apply_exl3_experts(x, ids, w, layer, fused=True)
+        fuse_scratch = next(v for k, v in _FAT_GROUPED_CACHE.items() if k[-1] == 0)
+        assert "h13" not in fuse_scratch
+        from vllm.model_executor.layers.quantization.exl3 import _FAT_GROUPED_TABLES
+
+        nr = int(next(iter(_FAT_GROUPED_TABLES.values()))["num_rows"].item())
+        assert nr > 0
+        h2_diff = float(
+            (h2_keep[:nr].float() - fuse_scratch["h2"][:nr].float()).abs().max()
+        )
+        assert h2_diff == 0.0, f"fused vs gather h2 maxabs={h2_diff} num_rows={nr}"
+        assert torch.equal(y_keep, y_fuse), "fused vs gather output mismatch with identical h2"
+        results["mixed"]["h2_fused_vs_gather_maxabs"] = h2_diff
+
         # --- value regimes: ordinary small, saturation/clamp, near-zero ---
         for label, scale in (("small", 0.05), ("saturate", 40.0), ("near_zero", 1e-3)):
             xs = (x.float() * scale).half()
@@ -1110,8 +1133,10 @@ def _check_grouped_fat(device) -> None:
         assert torch.isfinite(y_bad).all() and float(y_bad.abs().max()) == 0.0
         layer.expert_map = None
 
-        # --- scratch growth outside capture, warm reuse ---
-        base_ptr = _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]["h13"].data_ptr()
+        # --- scratch growth outside capture, warm reuse (h2 only) ---
+        scratch0 = _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]
+        assert "h13" not in scratch0, "fused path must not allocate h13"
+        base_ptr = scratch0["h2"].data_ptr()
         xb = torch.randn(1200, 256, generator=g).half().to(device)
         idsb = torch.zeros(1200, 2, dtype=torch.long, device=device)
         idsb[:, 1] = 1
@@ -1121,14 +1146,15 @@ def _check_grouped_fat(device) -> None:
         ye2b = apply_exl3_experts(xb, idsb, wb, layer, fused=True)
         os.environ["EXL3_FAT_GROUPED"] = "1"
         ye3b = apply_exl3_experts(xb, idsb, wb, layer, fused=True)
-        grown = _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]["h13"]
+        grown = _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]["h2"]
         assert int(grown.shape[0]) >= 2400, grown.shape
+        assert "h13" not in _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]
         sb2 = _err_stats(ylb, ye2b)
         sb3 = _err_stats(ylb, ye3b)
         results["grown_1200"] = {"e2_vs_loop": sb2, "e3_vs_loop": sb3}
         _assert_e3_within("grown_1200", sb2, sb3)
         apply_exl3_experts(x, ids, w, layer, fused=True)
-        assert _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]["h13"].data_ptr() == grown.data_ptr()
+        assert _FAT_GROUPED_CACHE[next(iter(_FAT_GROUPED_CACHE))]["h2"].data_ptr() == grown.data_ptr()
         del base_ptr
 
         # --- CUDA graph: capture a batch > cap, replay with changed data ---
@@ -1205,6 +1231,32 @@ def _check_grouped_fat(device) -> None:
                 s3 = _err_stats(yl, ye3)
                 results["real"][label] = {"e2_vs_loop": s2, "e2_repeat": _err_stats(ye2, ye2b), "e3_vs_loop": s3, "e3_vs_e2": _err_stats(ye2, ye3)}
                 _assert_e3_within(f"real_{label}", s2, s3)
+            # At least 3 real layers: fused vs gather h2 maxabs == 0.
+            h2_layers = {}
+            for layer_idx in (3, 4, 5):
+                packed = _real_expert_layer(device, n_exp=3, cap=cap, layer_idx=layer_idx)
+                if packed is None:
+                    break
+                rlayer_i, hidden_i, _inter_i = packed
+                rx = torch.randn(rt, hidden_i, generator=g).half().to(device)
+                os.environ["GLM53_E3_KEEP_GATHER"] = "1"
+                _FAT_GROUPED_CACHE.clear()
+                yk = apply_exl3_experts(rx, rids, rw, rlayer_i, fused=True)
+                keep_s = next(v for k, v in _FAT_GROUPED_CACHE.items() if k[-1] == 1)
+                h2k = keep_s["h2"].clone()
+                os.environ["GLM53_E3_KEEP_GATHER"] = "0"
+                _FAT_GROUPED_CACHE.clear()
+                yf = apply_exl3_experts(rx, rids, rw, rlayer_i, fused=True)
+                fuse_s = next(v for k, v in _FAT_GROUPED_CACHE.items() if k[-1] == 0)
+                from vllm.model_executor.layers.quantization.exl3 import _FAT_GROUPED_TABLES as _TABS
+                nr_i = int(next(iter(_TABS.values()))["num_rows"].item())
+                diff_i = float((h2k[:nr_i].float() - fuse_s["h2"][:nr_i].float()).abs().max())
+                assert diff_i == 0.0, f"layer {layer_idx} h2 maxabs={diff_i}"
+                assert torch.equal(yk, yf)
+                h2_layers[layer_idx] = diff_i
+                del rlayer_i
+            results["real"]["h2_fused_vs_gather"] = h2_layers
+            assert len(h2_layers) >= 3, h2_layers
             del rlayer
             torch.cuda.empty_cache()
 

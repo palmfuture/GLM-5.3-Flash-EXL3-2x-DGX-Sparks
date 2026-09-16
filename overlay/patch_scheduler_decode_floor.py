@@ -44,8 +44,10 @@ Fair knobs (read at runtime; identical on every rank):
   GLM53_FAIR_PREFILL_MAX_STEP_MS      default 2000 (estimated mixed-step limit)
   GLM53_FAIR_PREFILL_MAX_CHUNKS       default 1
 
-Versioned installer: `# [glm53-decode-floor:v5]`. v1 (no version), v2, v3
-and v4 images are unpatched then re-patched. Fail closed if anchors drift.
+Versioned installer: `# [glm53-decode-floor:v6]`. v1 (no version), v2, v3,
+v4 and v5 images are unpatched then re-patched. Fail closed if anchors drift.
+v6: a step that already has decode work does not also take a prefill chunk
+(prefill_turn holds decode tokens so the uniform decode graph stays intact).
 """
 from __future__ import annotations
 
@@ -66,6 +68,7 @@ MARK_V2 = "# [glm53-decode-floor:v2]"
 MARK_V3 = "# [glm53-decode-floor:v3]"
 MARK_V4 = "# [glm53-decode-floor:v4]"
 MARK_V5 = "# [glm53-decode-floor:v5]"
+MARK_V6 = "# [glm53-decode-floor:v6]"
 
 IMPORT_OLD = """import itertools
 import time
@@ -252,7 +255,7 @@ V3_WAITING_MAMBA_NEW = """                        num_new_tokens = self._mamba_b
                             break
 """
 
-class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
+class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
     """Bound contention using completion feedback, without synchronizing GPUs."""
 
     LADDER = (128, 256, 512, 768, 1024, 1536, 2048)
@@ -288,6 +291,8 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
         self.step_mode = "solo"
         self.defer_reason = "none"
         self.missed_prefill = 0
+        self.empty_isolated = 0
+        self._busy = []
         self._model_cache = None
 
     def _e(self, name, default):
@@ -467,6 +472,25 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
     def _credit_limit(self):
         return min(self.max_step_s, self._est_dt(max(self.chunk, max(self.LADDER))))
 
+    def _clamp_credit(self):
+        cap = self._credit_limit()
+        c = self.credit
+        if c != c:  # NaN
+            self.credit = 0.0
+            return
+        if c > cap:
+            self.credit = cap
+        elif c < -cap:
+            self.credit = -cap
+
+    def _prefill_in_last_1s(self, now):
+        """Accounted prefill busy seconds whose completion fell in the last 1s."""
+        cutoff = now - 1.0
+        return sum(dt for t, kind, dt in self._busy if t >= cutoff and kind == "prefill")
+
+    def _never_served_prefill(self):
+        return any(r.request_id not in self.last_service for r in self._candidates)
+
     def _rank_prefills(self, prefills):
         return sorted(prefills, key=lambda r: (
             self.last_service.get(r.request_id, 0.0),
@@ -503,6 +527,18 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
         return (self.mode == "fair" and self._open_rec is not None
                 and self._open_rec["had_decode"]
                 and self.needs_prefill_compute(request))
+
+    def hold_decode(self, request):
+        """Prefill-only turn: do not mix decode tokens into this step.
+
+        Only when a prefill can actually be funded. Holding decode on an
+        unfunded turn livelocks: prefills wait for credit, decode never
+        runs to repay it.
+        """
+        return (self.mode == "fair"
+                and self.step_mode == "prefill_turn"
+                and self._prefill_can_grant()
+                and not self.needs_prefill_compute(request))
 
     def begin_step(self, sched):
         now = self._now()
@@ -559,10 +595,44 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
         if self.inflight_prefill:
             self.step_mode = "decode_only"
             self.defer_reason = "async_inflight"
+        elif self.empty_isolated >= 2:
+            # Two empty isolated turns in a row: holding decode again would
+            # spin the engine idle. Run decode once, then retry prefill.
+            self.step_mode = "decode_only"
+            self.defer_reason = "empty_isolated"
+            self.empty_isolated = 0
+        elif (not self._never_served_prefill()
+              and self._prefill_in_last_1s(now) >= 0.80):
+            # Cap prefill to 800ms/s so a 1s window keeps ≥12 decode tok/s
+            # (0.20 × ~63). Newcomers still get an immediate first turn.
+            self.step_mode = "decode_only"
+            self.defer_reason = "decode_floor"
         else:
             self.step_mode = "prefill_turn"
             self._promote_next()
         self._maybe_log()
+
+    def _prefill_can_grant(self):
+        rec = self._open_rec
+        if rec is None or not self.selected:
+            return False
+        now = self._now()
+        for request in self._candidates:
+            rid = request.request_id
+            if rid not in self.selected or rid in self._tried:
+                continue
+            remaining = self.prefill_remaining(request)
+            pick = self._target(remaining, self.max_step_s)
+            if pick is None:
+                continue
+            cap, cost = pick
+            if cost <= self.credit + 1e-9:
+                return True
+            age = now - self.last_service.get(rid, self.arrival[rid])
+            due = rid not in self.last_service or age >= self.interval_s
+            if due and self.credit >= -1e-9 and not rec["grants"] and not rec["borrowed"]:
+                return True
+        return False
 
     def cap_for(self, sched, request, computed=None):
         self.begin_step(sched)
@@ -633,12 +703,16 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
                      if n > 0}
         requests = getattr(sched, "requests", {})
         prefill = {}
+        had_decode_tokens = False
         for rid, n in scheduled.items():
             request = requests.get(rid)
-            if request is not None:
-                amount = min(n, self.prefill_remaining(request))
-                if amount > 0:
-                    prefill[rid] = amount
+            if request is None:
+                continue
+            amount = min(n, self.prefill_remaining(request))
+            if amount > 0:
+                prefill[rid] = amount
+            elif not self.needs_prefill_compute(request):
+                had_decode_tokens = True
         reserved = 0.0
         for rid, (_, estimate, _) in rec["grants"].items():
             # Never publish/charge a tentative grant that alignment, allocation,
@@ -648,9 +722,17 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
             reserved += actual_est
         if not scheduled:
             # Empty schedules do not necessarily have a completion callback.
+            # If we held decode for a prefill that then got 0 tokens, the next
+            # step must run decode or the engine spins idle.
+            if rec.get("had_decode") and rec.get("had_prefill_demand"):
+                self.empty_isolated += 1
+            else:
+                self.empty_isolated = 0
             return
+        self.empty_isolated = 0
         rec.update(output=scheduler_output, scheduled=scheduled,
-                   prefill_tokens=prefill, reserved=reserved)
+                   prefill_tokens=prefill, reserved=reserved,
+                   had_decode_tokens=had_decode_tokens)
         del rec["grants"]
         if self.mode == "fair":
             self.inflight[id(scheduler_output)] = rec
@@ -679,9 +761,15 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v5]
             self.served_tokens[rid] = self.served_tokens.get(rid, 0) + n
         n = sum(served.values())
         if rec["had_decode"]:
-            # Reservation was already debited; settle once, including overruns.
+            # Grant already subtracted cost; this nets -(1-share)*dt for
+            # prefill-only turns and +share*dt for decode-only turns.
             self.credit += rec["reserved"] + self.share * dt - (dt if n else 0.0)
-            self.credit = min(self.credit, self._credit_limit())
+            self._clamp_credit()
+            if rec.get("had_decode_tokens") and not n:
+                self._busy.append((now, "decode", dt))
+            elif n:
+                self._busy.append((now, "prefill", dt))
+            self._busy = [(t, k, d) for t, k, d in self._busy if t >= now - 2.0]
             if n and dt > 0:
                 self.mixed_samples.append((rec["shape"], n, dt))
                 self.mixed_samples = self.mixed_samples[-64:]
@@ -738,8 +826,8 @@ def _helper_text() -> str:
     return (
         "\n"
         + body
-        + "\n_GLM53_MIXED = _Glm53MixedPrefill()  # [glm53-decode-floor:v5]\n\n"
-        + "def _glm53_mixed_prefill_policy(sched, request, computed=None):  # [glm53-decode-floor:v5]\n"
+        + "\n_GLM53_MIXED = _Glm53MixedPrefill()  # [glm53-decode-floor:v6]\n\n"
+        + "def _glm53_mixed_prefill_policy(sched, request, computed=None):  # [glm53-decode-floor:v6]\n"
         + "    return _GLM53_MIXED.cap_for(sched, request, computed)\n\n\n"
     )
 
@@ -1059,6 +1147,40 @@ def unpatch_v4(text: str) -> str:
 # insertions above stay frozen so a v4 image can be unpatched exactly.
 V5_PAIRS = tuple((new.replace(MARK_V4, MARK_V5), old, label) for new, old, label in V4_PAIRS)
 
+# v6: prefill_turn holds decode tokens so a decode step never carries a
+# prefill chunk. Other anchors are v5 with the marker advanced.
+V6_RUNNING_NEW = """            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens = min(
+                num_new_tokens, token_budget, input_budget - draft_slots
+            )
+            mixed_cap = _glm53_mixed_prefill_policy(self, request)  # [glm53-decode-floor:v6]
+            if _GLM53_MIXED.hold_decode(request):
+                num_new_tokens = 0
+            elif mixed_cap is not None and _GLM53_MIXED.needs_prefill_compute(request):
+                num_new_tokens = min(num_new_tokens, mixed_cap)
+
+            # Make sure the input position does not exceed the max model len.
+"""
+V6_RUNNING_ZERO_NEW = """            if num_new_tokens == 0:
+                _GLM53_MIXED.note_scheduled(request, 0)  # [glm53-decode-floor:v6]
+                if _GLM53_MIXED.hold_decode(request):
+                    req_index += 1
+                    continue
+                # The request cannot be scheduled because one of the following
+"""
+
+
+def _v6_new(new: str, label: str) -> str:
+    if label == "running":
+        return V6_RUNNING_NEW
+    if label == "running_zero":
+        return V6_RUNNING_ZERO_NEW
+    return new.replace(MARK_V5, MARK_V6)
+
+
+V6_PAIRS = tuple((_v6_new(new, label), old, label) for new, old, label in V5_PAIRS)
+
 
 def unpatch_v5(text: str) -> str:
     for new, old, label in V5_PAIRS:
@@ -1080,19 +1202,43 @@ def apply_v5(text: str) -> str:
     return text
 
 
+def unpatch_v6(text: str) -> str:
+    for new, old, label in V6_PAIRS:
+        text = replace_once(text, new, old, label)
+    text = _strip_helper(text, "v6")
+    if MARK_V6 in text:
+        raise SystemExit(f"{P}: v6 leftover after unpatch")
+    return text
+
+
+def apply_v6(text: str) -> str:
+    if "import os\n" not in text.split("import time\n", 1)[0]:
+        text = replace_once(text, IMPORT_OLD, IMPORT_NEW, "import os")
+    needle = "from vllm.compilation.cuda_graph import CUDAGraphStat\n"
+    text = replace_once(text, needle, _helper_text() + needle, "helper")
+    for new, old, label in V6_PAIRS:
+        text = replace_once(text, old, new, label)
+    compile(text, str(P), "exec")
+    return text
+
+
 def main() -> int:
     if not P.is_file():
         raise SystemExit(f"missing {P}")
     text = P.read_text()
     original = text
-    if MARK_V5 in text:
-        # Validate existing anchors/helper instead of trusting the marker alone.
-        clean = unpatch_v5(text)
-        if apply_v5(clean) != text:
-            raise SystemExit(f"{P}: v5 helper drifted")
-        print(f"{P.name}: {MARK_V5} already present — verified")
+    if MARK_V6 in text:
+        clean = unpatch_v6(text)
+        rebuilt = apply_v6(clean)
+        if rebuilt != text:
+            P.write_text(rebuilt)
+            print(f"{P.name}: {MARK_V6} helper refreshed")
+        else:
+            print(f"{P.name}: {MARK_V6} already present — verified")
         return 0
-    if MARK_V4 in text:
+    if MARK_V5 in text:
+        text = unpatch_v5(text)
+    elif MARK_V4 in text:
         text = unpatch_v4(text)
     elif MARK_V3 in text:
         text = unpatch_v3(text)
@@ -1100,12 +1246,12 @@ def main() -> int:
         text = unpatch_v2(text)
     elif MARK in text or V1_HELPER_START in text:
         text = unpatch_v1(text)
-    text = apply_v5(text)
-    if MARK_V2 in text or MARK_V3 in text or MARK_V4 in text:
+    text = apply_v6(text)
+    if MARK_V2 in text or MARK_V3 in text or MARK_V4 in text or MARK_V5 in text:
         raise SystemExit(f"{P}: older marker left after migration")
     if text != original:
         P.write_text(text)
-    print(f"patched {P.name} ({MARK_V5})")
+    print(f"patched {P.name} ({MARK_V6})")
     return 0
 
 

@@ -61,6 +61,8 @@ _FAT_COUNT_CACHE: dict[tuple, tuple[torch.Tensor, torch.cuda.Stream]] = {}
 # Grouped (E3) fat-expert scratch: fat-row activation buffers, grown once.
 _FAT_GROUPED_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
 _FAT_GROUPED_BYTES: dict[tuple, int] = {}
+_FAT_GROUPED_TABLES: dict[tuple, dict[str, torch.Tensor]] = {}
+_FAT_GROUPED_MAX_ROWS: dict[tuple, int] = {}
 _FAT_BUCKET_EDGES = (16, 32, 64, 128, 256, 512, 1024, 2048)
 _FAT_STATS: dict[str, Any] = {
     "layers": 0,
@@ -185,14 +187,21 @@ def fat_kernel_enabled() -> bool:
 def grouped_fat_enabled() -> bool:
     """Enable the E3 grouped fat-expert kernels (experimental, default OFF).
 
-    One gather + one gate/up + one down launch cover every fat expert of a
-    layer from device-side segment tables: no per-expert launches and no
-    host synchronization on the routing counts. Needs the exl3_fat_moe
+    One gate/up (A gathered from x[token]*suh in load_stage) + one down
+    launch cover every fat expert of a layer from device-side segment
+    tables: no per-expert launches and no host synchronization on the
+    routing counts. GLM53_E3_KEEP_GATHER=1 restores the pre-fusion
+    gather kernel into h13 for numeric compares. Needs the exl3_fat_moe
     kernels (exllamav3_ext built with exl3_fat_moe.cu, or the additive
     exl3_fat_moe_ext module). EXL3_FAT_GROUPED=0 (default) leaves the E2
     path and its cap untouched.
     """
     return os.environ.get("EXL3_FAT_GROUPED", "0") != "0"
+
+
+def grouped_keep_gather() -> bool:
+    """Keep the h13 gather kernel (numeric compare vs fused load_stage)."""
+    return os.environ.get("GLM53_E3_KEEP_GATHER", "0") != "0"
 
 
 def fat_expert_log_enabled() -> bool:
@@ -235,6 +244,7 @@ EXL3_FAT_MOE_SYMBOLS = (
     "exl3_fat_moe_tile_rows_gateup",
     "exl3_fat_moe_tile_rows_down",
 )
+# Optional fused-A entry; old E3 images without it keep the gather kernel.
 # Grouped kernels: 16 B vector atomics (sm_90+); the image builds sm_121a.
 EXL3_FAT_MOE_MIN_CAPABILITY = (9, 0)
 _FAT_MOE_EXT_CACHE: list = []
@@ -245,25 +255,34 @@ def load_fat_moe_ext():
 
     Two supported sources: exllamav3_ext itself (bindings patched at the
     full image build by patch_exl3_fat_kernel.py) or the additive
-    `exl3_fat_moe_ext` module (layered candidate image). Resolved once.
+    `exl3_fat_moe_ext` module (layered candidate image). Prefer the module
+    that exports `exl3_fat_moe_gateup_from_x` so a layered image does not
+    keep the older gather-only symbols from exllamav3_ext. Resolved once.
     """
     if _FAT_MOE_EXT_CACHE:
         return _FAT_MOE_EXT_CACHE[0]
-    found = None
+    candidates: list[Any] = []
     try:
-        ext = load_exllamav3_ext()
-        if all(hasattr(ext, name) for name in EXL3_FAT_MOE_SYMBOLS):
-            found = ext
-    except Exception:
-        found = None
-    if found is None:
-        try:
-            import exl3_fat_moe_ext  # noqa: F401
+        import exl3_fat_moe_ext  # noqa: F401
 
-            if all(hasattr(exl3_fat_moe_ext, name) for name in EXL3_FAT_MOE_SYMBOLS):
-                found = exl3_fat_moe_ext
-        except Exception:
-            found = None
+        candidates.append(exl3_fat_moe_ext)
+    except Exception:
+        pass
+    try:
+        candidates.append(load_exllamav3_ext())
+    except Exception:
+        pass
+    found = None
+    fused = None
+    for mod in candidates:
+        if not all(hasattr(mod, name) for name in EXL3_FAT_MOE_SYMBOLS):
+            continue
+        if hasattr(mod, "exl3_fat_moe_gateup_from_x"):
+            fused = mod
+            break
+        if found is None:
+            found = mod
+    found = fused or found
     _FAT_MOE_EXT_CACHE.append(found)
     return found
 
@@ -1076,41 +1095,45 @@ def apply_exl3_batched_fat(
 
 
 def _grouped_scratch(
-    device: torch.device, rows: int, hidden: int, intermediate: int
+    device: torch.device,
+    rows: int,
+    hidden: int,
+    intermediate: int,
+    keep_h13: bool | None = None,
 ) -> dict[str, torch.Tensor]:
     """Fat-row activation buffers for the grouped tier, grown once.
 
-    Capacity covers every routed slot of the configured prefill chunk
-    (MAX_NUM_BATCHED_TOKENS x top-k, EXL3_FAT_GROUPED_TOPK, default 8) so
-    steady-state prefill never reallocates; a larger request grows it once
-    more (outside CUDA graph capture, where growth would be illegal).
-    Persistent: h13 [rows, hidden] fp16 + h2 [rows, intermediate] fp16.
+    Default persistent buffer is h2 [rows, intermediate] fp16. h13 is
+    allocated only when GLM53_E3_KEEP_GATHER=1. Capacity tracks the largest
+    fat-row count actually requested (and any previously measured peak);
+    it is not floored at MNBT×top-k. Growth during CUDA graph capture is
+    illegal and raises.
     """
-    configured = int(
-        os.environ.get(
-            "EXL3_FAT_SCRATCH_ROWS",
-            os.environ.get("MAX_NUM_BATCHED_TOKENS", "0"),
-        )
-        or 0
-    )
-    topk = int(os.environ.get("EXL3_FAT_GROUPED_TOPK", "8") or 8)
-    needed = max(256, rows)
-    key = (str(device), hidden, intermediate)
+    if keep_h13 is None:
+        keep_h13 = grouped_keep_gather()
+    needed = max(256, int(rows))
+    key = (str(device), int(hidden), int(intermediate), int(keep_h13))
+    peak = max(needed, _FAT_GROUPED_MAX_ROWS.get(key, 0))
+    _FAT_GROUPED_MAX_ROWS[key] = peak
     scratch = _FAT_GROUPED_CACHE.get(key)
-    if scratch is not None and int(scratch["h13"].shape[0]) >= needed:
+    if scratch is not None and int(scratch["h2"].shape[0]) >= peak:
         return scratch
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        have = 0 if scratch is None else int(scratch["h2"].shape[0])
         raise RuntimeError(
             "EXL3 grouped scratch growth during CUDA graph capture; warm the "
-            f"largest shape first (need {needed} rows)"
+            f"largest shape first (need {peak} rows, have {have})"
         )
-    capacity = max(needed, configured * topk)
+    capacity = 1 << (peak - 1).bit_length()
     scratch = {
-        "h13": torch.empty((capacity, hidden), dtype=torch.float16, device=device),
         "h2": torch.empty(
             (capacity, intermediate), dtype=torch.float16, device=device
         ),
     }
+    if keep_h13:
+        scratch["h13"] = torch.empty(
+            (capacity, hidden), dtype=torch.float16, device=device
+        )
     _FAT_GROUPED_CACHE[key] = scratch
     _FAT_GROUPED_BYTES[key] = sum(
         t.numel() * t.element_size() for t in scratch.values()
@@ -1122,6 +1145,45 @@ def _grouped_scratch(
 def _excl_cumsum(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     inclusive = torch.cumsum(x, 0)
     return inclusive - x, inclusive
+
+
+def _grouped_table_scratch(
+    device: torch.device, n_exp: int, rows_cap: int, tile_rows: int
+) -> dict[str, torch.Tensor]:
+    """Persistent segment/row tables. Grown outside CUDA graph capture."""
+    key = (str(device), int(n_exp), int(tile_rows))
+    max_segs = (int(rows_cap) + int(tile_rows) - 1) // int(tile_rows) + int(n_exp)
+    tab = _FAT_GROUPED_TABLES.get(key)
+    if (
+        tab is not None
+        and int(tab["row_token"].shape[0]) >= rows_cap
+        and int(tab["seg_expert"].shape[0]) >= max_segs
+    ):
+        return tab
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        have_rows = 0 if tab is None else int(tab["row_token"].shape[0])
+        raise RuntimeError(
+            "EXL3 grouped table growth during CUDA graph capture; warm the "
+            f"largest shape first (need {rows_cap} rows, have {have_rows})"
+        )
+    rows_alloc = max(int(rows_cap), 256 if tab is None else int(tab["row_token"].shape[0]))
+    segs_alloc = max(int(max_segs), 16 if tab is None else int(tab["seg_expert"].shape[0]))
+    rows_alloc = 1 << (rows_alloc - 1).bit_length()
+    segs_alloc = 1 << (max(1, segs_alloc) - 1).bit_length()
+    tab = {
+        "seg_idx": torch.arange(segs_alloc, device=device),
+        "row_idx": torch.arange(rows_alloc, device=device),
+        "seg_expert": torch.empty(segs_alloc, dtype=torch.int32, device=device),
+        "seg_row0": torch.empty(segs_alloc, dtype=torch.int32, device=device),
+        "seg_rows": torch.empty(segs_alloc, dtype=torch.int32, device=device),
+        "num_segs": torch.empty(1, dtype=torch.int32, device=device),
+        "num_rows": torch.empty(1, dtype=torch.int32, device=device),
+        "row_expert": torch.empty(rows_alloc, dtype=torch.int32, device=device),
+        "row_token": torch.empty(rows_alloc, dtype=torch.int64, device=device),
+        "row_weight": torch.empty(rows_alloc, dtype=torch.float16, device=device),
+    }
+    _FAT_GROUPED_TABLES[key] = tab
+    return tab
 
 
 def build_grouped_fat_tables(
@@ -1141,34 +1203,48 @@ def build_grouped_fat_tables(
     and the layer stays CUDA-graph capturable. `counts` excludes the
     invalid/nonlocal sentinel bucket, which the sort places after every
     real expert, so sentinel routes never enter a fat segment.
+
+    Segment/row output tensors are persistent (one alloc per device/shape,
+    not per layer).
     """
     n_exp = int(counts.numel())
     device = counts.device
+    rows_cap = int(rows_cap)
+    tile_rows = int(tile_rows)
+    max_segs = (rows_cap + tile_rows - 1) // tile_rows + n_exp
+    tab = _grouped_table_scratch(device, n_exp, rows_cap, tile_rows)
     fat_rows = torch.where(counts > cap, counts, torch.zeros_like(counts))
     row_off, row_cum = _excl_cumsum(fat_rows)
     sorted_off, _ = _excl_cumsum(counts)
     tiles = (fat_rows + (tile_rows - 1)) // tile_rows
     tile_off, tile_cum = _excl_cumsum(tiles)
-    num_segs = tile_cum[-1:].to(torch.int32)
-    num_rows = row_cum[-1:].to(torch.int32)
-    max_segs = (rows_cap + tile_rows - 1) // tile_rows + n_exp
-    seg = torch.arange(max_segs, device=device)
+    tab["num_segs"].copy_(tile_cum[-1:].to(torch.int32))
+    tab["num_rows"].copy_(row_cum[-1:].to(torch.int32))
+    seg = tab["seg_idx"][:max_segs]
     e = torch.searchsorted(tile_cum, seg, right=True).clamp_(max=n_exp - 1)
     local_tile = seg - tile_off[e]
-    seg_row0 = row_off[e] + local_tile * tile_rows
-    seg_rows = torch.clamp(fat_rows[e] - local_tile * tile_rows, min=0, max=tile_rows)
-    r = torch.arange(rows_cap, device=device)
+    tab["seg_expert"][:max_segs].copy_(e.to(torch.int32))
+    tab["seg_row0"][:max_segs].copy_((row_off[e] + local_tile * tile_rows).to(torch.int32))
+    tab["seg_rows"][:max_segs].copy_(
+        torch.clamp(fat_rows[e] - local_tile * tile_rows, min=0, max=tile_rows).to(
+            torch.int32
+        )
+    )
+    r = tab["row_idx"][:rows_cap]
     re = torch.searchsorted(row_cum, r, right=True).clamp_(max=n_exp - 1)
     src = (sorted_off[re] + (r - row_off[re])).clamp_(max=rows_cap - 1)
+    tab["row_expert"][:rows_cap].copy_(re.to(torch.int32))
+    torch.index_select(token_sorted, 0, src, out=tab["row_token"][:rows_cap])
+    torch.index_select(weight_sorted, 0, src, out=tab["row_weight"][:rows_cap])
     return {
-        "seg_expert": e.to(torch.int32),
-        "seg_row0": seg_row0.to(torch.int32),
-        "seg_rows": seg_rows.to(torch.int32),
-        "num_segs": num_segs,
-        "num_rows": num_rows,
-        "row_expert": re.to(torch.int32),
-        "row_token": token_sorted.index_select(0, src),
-        "row_weight": weight_sorted.index_select(0, src),
+        "seg_expert": tab["seg_expert"][:max_segs],
+        "seg_row0": tab["seg_row0"][:max_segs],
+        "seg_rows": tab["seg_rows"][:max_segs],
+        "num_segs": tab["num_segs"],
+        "num_rows": tab["num_rows"],
+        "row_expert": tab["row_expert"][:rows_cap],
+        "row_token": tab["row_token"][:rows_cap],
+        "row_weight": tab["row_weight"][:rows_cap],
     }
 
 
@@ -1182,7 +1258,10 @@ def apply_exl3_grouped_fat(
     cap: int,
     limit: float,
 ) -> None:
-    """E3: every fat expert of the layer in three launches, no host sync."""
+    """E3: every fat expert of the layer in two launches (fused A + down).
+
+    GLM53_E3_KEEP_GATHER=1 restores the third gather launch into h13.
+    """
     ext = load_fat_moe_ext()
     if ext is None:
         raise RuntimeError("EXL3 grouped tier selected but the E3 kernels are not loaded")
@@ -1197,8 +1276,10 @@ def apply_exl3_grouped_fat(
     hidden = int(xh.shape[1])
     intermediate = int(layer._exl3_intermediate_local)
     rows_cap = int(token_sorted.numel())
-    scratch = _grouped_scratch(device, rows_cap, hidden, intermediate)
-    h13 = scratch["h13"][:rows_cap]
+    keep_gather = grouped_keep_gather() or not hasattr(ext, "exl3_fat_moe_gateup_from_x")
+    scratch = _grouped_scratch(
+        device, rows_cap, hidden, intermediate, keep_h13=keep_gather
+    )
     h2 = scratch["h2"][:rows_cap]
     tile_gu = int(ext.exl3_fat_moe_tile_rows_gateup())
     tile_dn = int(ext.exl3_fat_moe_tile_rows_down())
@@ -1214,23 +1295,43 @@ def apply_exl3_grouped_fat(
             counts, cap, token_sorted, weight_sorted, rows_cap, tile_dn
         )
     )
-    ext.exl3_fat_moe_gather(
-        xh, tg["row_token"], tg["row_expert"], ptrs["gate_suh"], h13, tg["num_rows"]
-    )
-    ext.exl3_fat_moe_gateup(
-        h13,
-        ptrs["gate_trellis"],
-        ptrs["up_trellis"],
-        ptrs["gate_svh"],
-        ptrs["up_svh"],
-        ptrs["down_suh"],
-        h2,
-        tg["seg_expert"],
-        tg["seg_row0"],
-        tg["seg_rows"],
-        tg["num_segs"],
-        float(limit),
-    )
+    if keep_gather:
+        h13 = scratch["h13"][:rows_cap]
+        ext.exl3_fat_moe_gather(
+            xh, tg["row_token"], tg["row_expert"], ptrs["gate_suh"], h13, tg["num_rows"]
+        )
+        ext.exl3_fat_moe_gateup(
+            h13,
+            ptrs["gate_trellis"],
+            ptrs["up_trellis"],
+            ptrs["gate_svh"],
+            ptrs["up_svh"],
+            ptrs["down_suh"],
+            h2,
+            tg["seg_expert"],
+            tg["seg_row0"],
+            tg["seg_rows"],
+            tg["num_segs"],
+            float(limit),
+        )
+    else:
+        ext.exl3_fat_moe_gateup_from_x(
+            xh,
+            tg["row_token"],
+            tg["row_expert"],
+            ptrs["gate_suh"],
+            ptrs["gate_trellis"],
+            ptrs["up_trellis"],
+            ptrs["gate_svh"],
+            ptrs["up_svh"],
+            ptrs["down_suh"],
+            h2,
+            tg["seg_expert"],
+            tg["seg_row0"],
+            tg["seg_rows"],
+            tg["num_segs"],
+            float(limit),
+        )
     ext.exl3_fat_moe_down(
         h2,
         ptrs["down_trellis"],

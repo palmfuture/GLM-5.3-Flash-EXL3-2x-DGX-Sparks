@@ -564,7 +564,7 @@ validate_numeric_config() {
         echo "GPU_MEM_UTIL must be greater than 0 and at most 1 (got: $GPU_MEM_UTIL)" >&2
         return 2
     fi
-    _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
+    _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1048576 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
     if [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ]; then

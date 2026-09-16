@@ -8,9 +8,12 @@
 // token count exceeds the fused exl3_moe temp rows). Work is described by
 // device-side segment tables, so the host never synchronizes on routing.
 //
-//   exl3_fat_moe_gather   : h13[row] = had128(x[token[row]] * gate_suh[expert[row]])
-//   exl3_fat_moe_gateup   : h2 = had128(silu(clamp(had(g)*svh_g)) * clamp(had(u)*svh_u) * down_suh)
-//   exl3_fat_moe_down     : out[token] += had128(h2 @ W_down) * svh_d * route_weight
+//   exl3_fat_moe_gather         : h13[row] = had128(x[token[row]] * gate_suh[expert[row]])
+//                                 kept for GLM53_E3_KEEP_GATHER numeric compares
+//   exl3_fat_moe_gateup         : A from h13 (gather already done)
+//   exl3_fat_moe_gateup_from_x  : load_stage gathers A from x[token]*suh[expert]
+//                                 at the E2 fp16-mul-then-Hadamard boundary; no h13
+//   exl3_fat_moe_down           : out[token] += had128(h2 @ W_down) * svh_d * route_weight
 //
 // Segment tables (int32, device): seg_expert / seg_row0 / seg_rows describe
 // row tiles of the fat-row buffer (rows are grouped by expert, expert order).
@@ -28,6 +31,23 @@ void exl3_fat_moe_gather(
 void exl3_fat_moe_gateup(
     at::Tensor h13,          // [rows_cap, K] half
     at::Tensor gate_ptrs,    // [n_exp] int64 trellis pointers (K/16, N/16, 64) int16
+    at::Tensor up_ptrs,
+    at::Tensor gate_svh_ptrs,
+    at::Tensor up_svh_ptrs,
+    at::Tensor down_suh_ptrs,
+    at::Tensor h2,           // [rows_cap, N] half (out)
+    at::Tensor seg_expert,
+    at::Tensor seg_row0,
+    at::Tensor seg_rows,
+    at::Tensor num_segs,
+    double act_limit);
+
+void exl3_fat_moe_gateup_from_x(
+    at::Tensor x,            // [tokens, K] half
+    at::Tensor row_token,    // [rows_cap] int64
+    at::Tensor row_expert,   // [rows_cap] int32
+    at::Tensor suh_ptrs,     // [n_exp] int64 (device pointers, half[K])
+    at::Tensor gate_ptrs,
     at::Tensor up_ptrs,
     at::Tensor gate_svh_ptrs,
     at::Tensor up_svh_ptrs,

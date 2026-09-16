@@ -125,13 +125,57 @@ void fm_gather_kernel(
     }
 }
 
+// Store one 128-wide post-Hadamard row into the 4 A pipeline stages (32-col
+// slices) using the same swizzle load_stage applies when copying from h13.
+// Lane L holds cols L*4..L*4+3 after fm_had_row, matching fm_gather_kernel.
+template <int MB>
+__device__ __forceinline__ void fm_fill_a_from_x(
+    half* sh_a,
+    const half* __restrict__ x,
+    const int64_t* __restrict__ row_token,
+    const int* __restrict__ row_expert,
+    const half* const* __restrict__ suh_ptrs,
+    int row0,
+    int rows,
+    int size_k,
+    int blk)
+{
+    constexpr int TILE_M = MB * 16;
+    constexpr int A_STAGE = TILE_M * FM_TILE_K;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    for (int r = warp; r < TILE_M; r += FM_WARPS)
+    {
+        const int src_row = r < rows ? r : (rows > 0 ? rows - 1 : 0);
+        const int64_t token = row_token[row0 + src_row];
+        const half* suh = suh_ptrs[row_expert[row0 + src_row]] + blk * 128;
+        const half* src = x + token * (int64_t) size_k + blk * 128;
+        // E2 boundary (had_hf_r_128_inner<pre_scale>): fp16 x fp16 multiply,
+        // rounded, BEFORE the fp32 Hadamard. Same as fm_gather_kernel.
+        half4 hv = *reinterpret_cast<const half4*>(src + lane * 4);
+        half4 hs = *reinterpret_cast<const half4*>(suh + lane * 4);
+        hv.x = __hmul2(hv.x, hs.x);
+        hv.y = __hmul2(hv.y, hs.y);
+        float4 v = make_float4(__low2float(hv.x), __high2float(hv.x),
+                               __low2float(hv.y), __high2float(hv.y));
+        fm_had_row(v, lane);
+        const int slice = lane >> 3;
+        const int lane8 = lane & 7;
+        const int chunk = lane8 >> 1;
+        const int sub = (lane8 & 1) * 4;
+        half* dst = sh_a + slice * A_STAGE + r * FM_TILE_K + fm_swz(r, chunk) * 8 + sub;
+        fm_store_half4(dst, v);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared mainloop: acc[NS][MB][2] += A(tile rows, K) @ B_ns(K, 128 cols)
+// FROM_X: A is gathered from x[token]*suh[expert] every 128 K (no h13).
 // ---------------------------------------------------------------------------
 
 // NB_STRIDE: 16-col block offset between streams (0 = different matrices
 // over the same columns, 8 = adjacent 128-col halves of one matrix).
-template <int MB, int NS, int NB_STRIDE>
+template <int MB, int NS, int NB_STRIDE, bool FROM_X = false>
 __device__ __forceinline__ void fm_mainloop(
     const half* __restrict__ a,          // fat-row buffer [rows_cap, size_k]
     int size_k,
@@ -142,7 +186,11 @@ __device__ __forceinline__ void fm_mainloop(
     int n_block0,                        // first 16-col block of this tile
     half* sh_a,                          // FM_STAGES * MB*16*32 halves
     uint16_t* sh_b,                      // FM_STAGES * NS * FM_B_STAGE_WORDS
-    FragC (&acc)[NS][MB][2])
+    FragC (&acc)[NS][MB][2],
+    const half* __restrict__ x = nullptr,
+    const int64_t* __restrict__ row_token = nullptr,
+    const int* __restrict__ row_expert = nullptr,
+    const half* const* __restrict__ suh_ptrs = nullptr)
 {
     constexpr int TILE_M = MB * 16;
     constexpr int A_STAGE = TILE_M * FM_TILE_K;          // halves
@@ -168,19 +216,22 @@ __device__ __forceinline__ void fm_mainloop(
 
     auto load_stage = [&](int stage, int kt)
     {
-        half* sa = sh_a + stage * A_STAGE;
-        #pragma unroll
-        for (int i = 0; i < A_ITERS; ++i)
+        if constexpr (!FROM_X)
         {
-            int c = i * FM_THREADS + t;
-            if (c < A_CHUNKS)
+            half* sa = sh_a + stage * A_STAGE;
+            #pragma unroll
+            for (int i = 0; i < A_ITERS; ++i)
             {
-                int row = c >> 2;
-                int chunk = c & 3;
-                int src_row = row < rows ? row : rows - 1;
-                const half* src = a + (int64_t) (row0 + src_row) * size_k + kt * FM_TILE_K + chunk * 8;
-                half* dst = sa + row * FM_TILE_K + fm_swz(row, chunk) * 8;
-                cp_async(dst, src);
+                int c = i * FM_THREADS + t;
+                if (c < A_CHUNKS)
+                {
+                    int row = c >> 2;
+                    int chunk = c & 3;
+                    int src_row = row < rows ? row : rows - 1;
+                    const half* src = a + (int64_t) (row0 + src_row) * size_k + kt * FM_TILE_K + chunk * 8;
+                    half* dst = sa + row * FM_TILE_K + fm_swz(row, chunk) * 8;
+                    cp_async(dst, src);
+                }
             }
         }
         uint16_t* sb = sh_b + stage * B_STAGE;
@@ -203,6 +254,12 @@ __device__ __forceinline__ void fm_mainloop(
         }
     };
 
+    if constexpr (FROM_X)
+    {
+        fm_fill_a_from_x<MB>(sh_a, x, row_token, row_expert, suh_ptrs, row0, rows, size_k, 0);
+        __syncthreads();
+    }
+
     #pragma unroll
     for (int s = 0; s < FM_STAGES - 1; ++s)
     {
@@ -215,6 +272,16 @@ __device__ __forceinline__ void fm_mainloop(
 
     for (int kt = 0; kt < k_tiles; ++kt)
     {
+        if constexpr (FROM_X)
+        {
+            if (kt > 0 && (kt & 3) == 0)
+            {
+                __syncthreads();
+                fm_fill_a_from_x<MB>(
+                    sh_a, x, row_token, row_expert, suh_ptrs, row0, rows, size_k, kt / 4);
+                __syncthreads();
+            }
+        }
         cp_async_wait<FM_STAGES - 2>();
         __syncthreads();
         int nk = kt + FM_STAGES - 1;
@@ -283,9 +350,14 @@ __device__ __forceinline__ void fm_stage_acc(
 // gate/up GEMM + SwiGLU + down-input Hadamard
 // ---------------------------------------------------------------------------
 
+template <bool FROM_X>
 __global__ __launch_bounds__(FM_THREADS, 2)
 void fm_gateup_kernel(
     const half* __restrict__ h13,
+    const half* __restrict__ x,
+    const int64_t* __restrict__ row_token,
+    const int* __restrict__ row_expert,
+    const half* const* __restrict__ suh_ptrs,
     const uint16_t* const* __restrict__ gate_ptrs,
     const uint16_t* const* __restrict__ up_ptrs,
     const half* const* __restrict__ gate_svh_ptrs,
@@ -318,13 +390,20 @@ void fm_gateup_kernel(
         const int e = seg_expert[seg];
         const int row0 = seg_row0[seg];
         const int rows = seg_rows[seg];
+        if (rows <= 0) continue;
         const uint16_t* const packed[NS] = { gate_ptrs[e], up_ptrs[e] };
         const half* svh_g = gate_svh_ptrs[e] + n_base;
         const half* svh_u = up_svh_ptrs[e] + n_base;
         const half* suh_d = down_suh_ptrs[e] + n_base;
 
         FragC acc[NS][MB][2];
-        fm_mainloop<MB, NS, 0>(h13, size_k, row0, rows, packed, tiles_n, n_base / 16, sh_a, sh_b, acc);
+        if constexpr (FROM_X)
+            fm_mainloop<MB, NS, 0, true>(
+                nullptr, size_k, row0, rows, packed, tiles_n, n_base / 16, sh_a, sh_b, acc,
+                x, row_token, row_expert, suh_ptrs);
+        else
+            fm_mainloop<MB, NS, 0, false>(
+                h13, size_k, row0, rows, packed, tiles_n, n_base / 16, sh_a, sh_b, acc);
 
         #pragma unroll
         for (int mb = 0; mb < MB; ++mb)
@@ -421,6 +500,7 @@ void fm_down_kernel(
         const int e = seg_expert[seg];
         const int row0 = seg_row0[seg];
         const int rows = seg_rows[seg];
+        if (rows <= 0) continue;
         const uint16_t* const packed[NS] = { down_ptrs[e], down_ptrs[e] };
         const half* svh = down_svh_ptrs[e] + n_base;
 
@@ -487,7 +567,7 @@ int fm_grid_y(int64_t max_segs)
     return (int) g;
 }
 
-bool fm_attr_set[2] = { false, false };
+bool fm_attr_set[3] = { false, false, false };
 
 }  // namespace
 
@@ -574,12 +654,92 @@ void exl3_fat_moe_gateup(
     constexpr int smem = fm_smem_bytes<FM_MB_GATEUP, 2>();
     if (!fm_attr_set[0])
     {
-        cudaFuncSetAttribute(fm_gateup_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(
+            fm_gateup_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         fm_attr_set[0] = true;
     }
     dim3 grid(size_n / FM_TILE_N, fm_grid_y(seg_expert.size(0)));
-    fm_gateup_kernel<<<grid, FM_THREADS, smem, stream>>>(
+    fm_gateup_kernel<false><<<grid, FM_THREADS, smem, stream>>>(
         reinterpret_cast<const half*>(h13.data_ptr()),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        reinterpret_cast<const uint16_t* const*>(gate_ptrs.data_ptr()),
+        reinterpret_cast<const uint16_t* const*>(up_ptrs.data_ptr()),
+        reinterpret_cast<const half* const*>(gate_svh_ptrs.data_ptr()),
+        reinterpret_cast<const half* const*>(up_svh_ptrs.data_ptr()),
+        reinterpret_cast<const half* const*>(down_suh_ptrs.data_ptr()),
+        reinterpret_cast<half*>(h2.data_ptr()),
+        reinterpret_cast<const int*>(seg_expert.data_ptr()),
+        reinterpret_cast<const int*>(seg_row0.data_ptr()),
+        reinterpret_cast<const int*>(seg_rows.data_ptr()),
+        reinterpret_cast<const int*>(num_segs.data_ptr()),
+        size_k,
+        size_n,
+        (float) act_limit);
+    cuda_check(cudaPeekAtLastError());
+}
+
+void exl3_fat_moe_gateup_from_x(
+    at::Tensor x,
+    at::Tensor row_token,
+    at::Tensor row_expert,
+    at::Tensor suh_ptrs,
+    at::Tensor gate_ptrs,
+    at::Tensor up_ptrs,
+    at::Tensor gate_svh_ptrs,
+    at::Tensor up_svh_ptrs,
+    at::Tensor down_suh_ptrs,
+    at::Tensor h2,
+    at::Tensor seg_expert,
+    at::Tensor seg_row0,
+    at::Tensor seg_rows,
+    at::Tensor num_segs,
+    double act_limit)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == at::kHalf && x.dim() == 2,
+                "x must be a contiguous half [tokens, K] CUDA tensor");
+    TORCH_CHECK(x.size(1) % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(h2.is_cuda() && h2.is_contiguous() && h2.scalar_type() == at::kHalf && h2.dim() == 2,
+                "h2 must be a contiguous half [rows_cap, N] CUDA tensor");
+    TORCH_CHECK(row_token.is_cuda() && row_token.scalar_type() == at::kLong && row_token.is_contiguous()
+                && row_token.size(0) >= h2.size(0), "row_token must be int64[rows_cap]");
+    TORCH_CHECK(row_expert.is_cuda() && row_expert.scalar_type() == at::kInt && row_expert.is_contiguous()
+                && row_expert.size(0) >= h2.size(0), "row_expert must be int32[rows_cap]");
+    int size_k = (int) x.size(1);
+    int size_n = (int) h2.size(1);
+    TORCH_CHECK(size_k % FM_TILE_K == 0 && size_k >= FM_TILE_K, "K must be a multiple of 32");
+    TORCH_CHECK(size_n % FM_TILE_N == 0, "N must be a multiple of 128");
+    check_ptr_table(suh_ptrs, "suh_ptrs", 1);
+    check_ptr_table(gate_ptrs, "gate_ptrs", 1);
+    check_ptr_table(up_ptrs, "up_ptrs", gate_ptrs.size(0));
+    check_ptr_table(gate_svh_ptrs, "gate_svh_ptrs", gate_ptrs.size(0));
+    check_ptr_table(up_svh_ptrs, "up_svh_ptrs", gate_ptrs.size(0));
+    check_ptr_table(down_suh_ptrs, "down_suh_ptrs", gate_ptrs.size(0));
+    check_seg(seg_expert, "seg_expert");
+    check_seg(seg_row0, "seg_row0");
+    check_seg(seg_rows, "seg_rows");
+    check_seg(num_segs, "num_segs");
+    TORCH_CHECK(seg_row0.size(0) == seg_expert.size(0) && seg_rows.size(0) == seg_expert.size(0),
+                "segment tables must share a length");
+
+    constexpr int smem = fm_smem_bytes<FM_MB_GATEUP, 2>();
+    if (!fm_attr_set[2])
+    {
+        cudaFuncSetAttribute(
+            fm_gateup_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        fm_attr_set[2] = true;
+    }
+    dim3 grid(size_n / FM_TILE_N, fm_grid_y(seg_expert.size(0)));
+    fm_gateup_kernel<true><<<grid, FM_THREADS, smem, stream>>>(
+        nullptr,
+        reinterpret_cast<const half*>(x.data_ptr()),
+        reinterpret_cast<const int64_t*>(row_token.data_ptr()),
+        reinterpret_cast<const int*>(row_expert.data_ptr()),
+        reinterpret_cast<const half* const*>(suh_ptrs.data_ptr()),
         reinterpret_cast<const uint16_t* const*>(gate_ptrs.data_ptr()),
         reinterpret_cast<const uint16_t* const*>(up_ptrs.data_ptr()),
         reinterpret_cast<const half* const*>(gate_svh_ptrs.data_ptr()),

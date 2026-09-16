@@ -256,6 +256,7 @@ class FairTests(unittest.TestCase):
 
     def test_positive_credit_does_not_override_step_latency(self):
         self.learn(cost=3.0)
+        self.p._busy = [(self.clock(), 'decode', 1.0)]
         self.p.credit = 10
         self.assertEqual(self.p.cap_for(self.s, self.b), 0)
         self.assertEqual(self.p.defer_reason, 'gap_budget')
@@ -268,6 +269,7 @@ class FairTests(unittest.TestCase):
 
     def test_cost_feedback_can_shrink_chunks(self):
         self.learn(cost=1.5)
+        self.p._busy = [(self.clock(), 'decode', 1.0)]
         self.p.credit = 1
         self.assertEqual(self.p.cap_for(self.s, self.b), 128)
 
@@ -426,13 +428,102 @@ class FairTests(unittest.TestCase):
         exec(code, ns)
         return ns
 
+    def test_prefill_turn_holds_decode(self):
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'prefill_turn')
+        self.assertTrue(self.p.hold_decode(self.a))
+        self.assertFalse(self.p.hold_decode(self.b))
+        self.assertEqual(self.p.cap_for(self.s, self.b), 256)
+
+    def test_decode_only_step_has_no_prefill_chunk(self):
+        self.assertEqual(self.p.cap_for(self.s, self.b), 256)
+        self.submit({'B': 256})
+        self.assertEqual(self.p.cap_for(self.s, self.b), 0)
+        self.assertEqual(self.p.step_mode, 'decode_only')
+        self.assertFalse(self.p.hold_decode(self.a))
+
+    def test_decode_floor_after_prefill_busy(self):
+        self.learn()
+        self.p.credit = 10.0
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        cap = self.p.cap_for(self.s, self.b)
+        self.assertGreater(cap, 0)
+        out = Out({'B': cap})
+        self.p.finish_step(self.s, out)
+        self.complete(out, 0.85)
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'decode_only')
+        self.assertEqual(self.p.defer_reason, 'decode_floor')
+        self.assertFalse(self.p.hold_decode(self.a))
+
+    def test_never_served_skips_decode_floor(self):
+        self.p.credit = 10.0
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'prefill_turn')
+        self.assertNotIn(self.b.request_id, self.p.last_service)
+        self.assertGreater(self.p.cap_for(self.s, self.b), 0)
+
+    def test_empty_isolated_prefill_forces_decode_next_step(self):
+        self.learn()
+        self.p._busy.append((self.clock(), 'decode', 1.0))
+        self.p.credit = 10.0
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'prefill_turn')
+        self.assertTrue(self.p.hold_decode(self.a))
+        self.p.finish_step(self.s, Out({}))
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'prefill_turn')
+        self.p.finish_step(self.s, Out({}))
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'decode_only')
+        self.assertEqual(self.p.defer_reason, 'empty_isolated')
+        self.assertFalse(self.p.hold_decode(self.a))
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertEqual(self.p.step_mode, 'prefill_turn')
+
+    def test_isolated_prefill_nets_one_minus_share(self):
+        self.learn()
+        self.p._busy.append((self.clock(), 'decode', 1.0))
+        self.p.credit = 10.0
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertTrue(self.p.hold_decode(self.a))
+        cap = self.p.cap_for(self.s, self.b)
+        self.assertGreater(cap, 0)
+        out = Out({'B': cap})
+        self.p.finish_step(self.s, out)
+        before = self.p.credit
+        rec = self.p.inflight[id(out)]
+        self.complete(out, 0.5)
+        self.assertEqual(self.p.credit, self.p.credit)  # finite
+        self.assertGreater(self.p._credit_limit(), 0)
+        self.assertNotAlmostEqual(self.p.credit, before + self.p.share * 0.5, places=3)
+        del rec
+
+    def test_unfunded_prefill_turn_does_not_hold_decode(self):
+        self.learn()
+        self.p._busy.append((self.clock(), 'decode', 1.0))
+        self.p.credit = -0.2
+        self.p.begin_step(self.s)
+        self.assertFalse(self.p.hold_decode(self.a))
+        self.assertEqual(self.p.cap_for(self.s, self.b), 0)
+
     def test_decode_order_reserves_real_input_and_draft_capacity(self):
+        # Inflight prefill → decode_only: A keeps the graph, B gets cap 0.
+        self.submit({'B': 256})
         ns = self.running_loop(16)
         self.assertEqual(ns['num_scheduled_tokens'], {'A': 8})
         self.assertEqual(ns['input_budget'], 0)
         self.assertEqual([r.request_id for r in self.s.running], ['A', 'B'])
 
     def test_prefill_cannot_preempt_incumbent_for_kv(self):
+        self.submit({'B': 256})
         ns = self.running_loop(7168, allocate=lambda r, n, **kw: [] if r is self.a else None)
         self.assertEqual(ns['num_scheduled_tokens'], {'A': 8})
         self.assertEqual([r.request_id for r in self.s.running], ['A', 'B'])
@@ -453,13 +544,13 @@ def installation_tests():
     if src is None:
         raise SystemExit('Set GLM53_SCHEDULER_PY_SRC to the pinned scheduler source')
     clean = src.read_text()
-    for marker, fn in [(mod.MARK_V5, mod.unpatch_v5), (mod.MARK_V4, mod.unpatch_v4), (mod.MARK_V3, mod.unpatch_v3), (mod.MARK_V2, mod.unpatch_v2)]:
+    for marker, fn in [(mod.MARK_V6, mod.unpatch_v6), (mod.MARK_V5, mod.unpatch_v5), (mod.MARK_V4, mod.unpatch_v4), (mod.MARK_V3, mod.unpatch_v3), (mod.MARK_V2, mod.unpatch_v2)]:
         if marker in clean:
             clean = fn(clean)
     if mod.V1_HELPER_START in clean:
         clean = mod.unpatch_v1(clean)
     with tempfile.TemporaryDirectory() as temp:
-        for version in (0, 1, 2, 3, 4):
+        for version in (0, 1, 2, 3, 4, 5):
             text = clean
             if version:
                 marker = mod.MARK if version == 1 else getattr(mod, f'MARK_V{version}')
@@ -467,7 +558,10 @@ def installation_tests():
                           f'\nclass _Glm53MixedPrefill:  {marker}\n    pass\n\n')
                 needle = 'from vllm.compilation.cuda_graph import CUDAGraphStat\n'
                 text = text.replace(needle, helper + needle, 1)
-                if version == 4:
+                if version == 5:
+                    for new, old, label in mod.V5_PAIRS:
+                        text = mod.replace_once(text, old, new, label)
+                elif version == 4:
                     for new, old, label in mod.V4_PAIRS:
                         text = mod.replace_once(text, old, new, label)
                 else:
@@ -483,7 +577,7 @@ def installation_tests():
             subprocess.run([sys.executable, str(PATCH)], env=env, check=True, capture_output=True)
             installed = target.read_text()
             compile(installed, str(target), 'exec')
-            assert mod.MARK_V5 in installed and mod.MARK_V4 not in installed and mod.MARK_V3 not in installed and mod.MARK_V2 not in installed
+            assert mod.MARK_V6 in installed and mod.MARK_V5 not in installed and mod.MARK_V4 not in installed and mod.MARK_V3 not in installed and mod.MARK_V2 not in installed
             subprocess.run([sys.executable, str(PATCH)], env=env, check=True, capture_output=True)
             assert target.read_text() == installed
             # Marker alone must not suppress validation or overwrite source drift.

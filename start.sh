@@ -180,10 +180,9 @@ DFLASH_TOKENS="${DFLASH_TOKENS:-7}"
 # Do not pin attention_backend: SM121 already prefers FLASH_ATTN for
 # non-causal dense SWA. TRITON_ATTN was an SM120 mask-fix this image lacks.
 DFLASH_DRAFT_TP="${DFLASH_DRAFT_TP-2}"
-# 900k with the E3 grouped tier (default since 2026-09-07). One request needs ~7.4 GiB
-# + 7.1 GiB per 1M tokens of KV at MNBT 7168; E3 keeps a 560 MiB fat-row scratch that
-# vLLM charges to the KV budget, so 1M no longer fits at util <= 0.87 on this kit.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-850000}"
+# 1,048,576 with E3 after h13 was dropped (~112 MiB h2 scratch, was ~560 MiB).
+# Pin --kv-cache-memory-bytes from the live pool after a successful boot.
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 # 0.85 leaves ~2.4 GiB more host headroom than 0.87 (long prefills need it; a 256k
 # prefill at 0.87 with zero MemAvailable crashed a head on 2026-09-06).
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
@@ -290,7 +289,7 @@ EXL3_FUSED_MOE="${EXL3_FUSED_MOE:-1}"
 # Tile (P2a) and TEMP_ROWS=1024 (P2b) both lost at MNBT=1024 — leave 128.
 EXL3_MOE_ROW_TILE="${EXL3_MOE_ROW_TILE:-0}"
 # E3 grouped fat-expert kernels (default ON since 2026-09-07: +37-45% cold prefill):
-# one gather + gate/up + down launch per layer for every fat expert from device-side
+# fused A from x[token]*suh in load_stage + down, per layer, every fat expert from device-side
 # tables, no host sync. Needs the exl3_fat_moe kernels in the image (fails closed at
 # load otherwise; start.sh rebuilds when the recipe stamp drifts). 0 = the E2 kernel path.
 EXL3_FAT_GROUPED="${EXL3_FAT_GROUPED:-1}"
@@ -605,7 +604,7 @@ validate_numeric_config() {
         echo "GPU_MEM_UTIL must be greater than 0 and at most 1 (got: $GPU_MEM_UTIL)" >&2
         return 2
     fi
-    _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1000000 || return
+    _glm53_canonical_positive_int MAX_MODEL_LEN "$MAX_MODEL_LEN" 1048576 || return
     _glm53_canonical_positive_int MAX_NUM_SEQS "$MAX_NUM_SEQS" 4096 || return
     _glm53_canonical_positive_int MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS" 8388608 || return
     if [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ]; then
