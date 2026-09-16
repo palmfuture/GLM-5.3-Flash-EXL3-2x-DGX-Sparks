@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — decode-floor installer restart idempotence
+
+`patch_scheduler_decode_floor.py` no longer rejects a healthy patched
+scheduler on container restart. The v5 verify path used to unpatch and
+re-apply at the fixed cuda_graph import anchor; once
+`patch_adaptive_k.py` had inserted its own helper between the decode-floor
+helper and that anchor, re-apply relocated the helper and the byte-compare
+failed with "v5 helper drifted", killing the entrypoint. Verification now
+validates every v5 insertion, the `import os` edit, and the complete owned
+helper region before stripping it in memory. The helper may sit on either
+side of the adaptive-k block without being rewritten. Drift and duplicate
+helpers inside that region, leftover markers, and invalid syntax still fail
+closed; this is not a whole-file semantic verifier for unrelated overlays.
+
+`tests/test_scheduler_decode_floor_restart.py` builds a synthetic scheduler
+from the installer's own anchors and covers apply, both overlay orders,
+repeat verification, and drift/duplicate rejection on CPU.
+
 ## Unreleased — omitted-only output-token defaults
 
 `DEFAULT_MAX_NEW_TOKENS` now changes only omitted request limits, including

@@ -149,7 +149,7 @@ MODEL_CACHE_NAME="${MODEL_CACHE_NAME:-models--${MODEL//\//--}}"
 MODEL_FALLBACK_CACHE_NAME="${MODEL_FALLBACK_CACHE_NAME:-models--${MODEL_FALLBACK//\//--}}"
 # Hub commit on the Mia-AiLab mirror (the 5ab363a8-byte-identical upload).
 MODEL_REVISION="${MODEL_REVISION:-25a44fdbf16862a46b7cc9921142c6c81350af2f}"
-IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
+IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
 
@@ -197,6 +197,9 @@ WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"
 WORKER2_CX7_IF="${WORKER2_CX7_IF:-$WORKER_CX7_IF}"
 WORKER2_CX7_IB="${WORKER2_CX7_IB:-$WORKER_CX7_IB}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# Empty = keep NCCL_MAX_NCHANNELS (default 8 on this ring) and pin MIN to match.
+# A positive integer pins both MIN and MAX (same knob as start.sh).
+NCCL_NCHANNELS="${NCCL_NCHANNELS:-}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # The RoCEv2 GID index is per-NIC: the usable entry is the one whose GID matches
 # that node's own fabric IP. Most pairs share a good index; some do not (this kit
@@ -228,6 +231,10 @@ NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-1048576}"
 NCCL_LL128_BUFFSIZE="${NCCL_LL128_BUFFSIZE:-262144}"
 NCCL_PROTO="${NCCL_PROTO:-^LL128}"
 NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+if [ -n "${NCCL_NCHANNELS}" ]; then
+    NCCL_MAX_NCHANNELS="$NCCL_NCHANNELS"
+fi
+NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-$NCCL_MAX_NCHANNELS}"
 NCCL_HOST_DIR="${NCCL_HOST_DIR:-$HOME/nccl-2.30.7}"
 WORKER_NCCL_HOST_DIR="${WORKER_NCCL_HOST_DIR:-$WORKER_HOME/nccl-2.30.7}"
 WORKER2_NCCL_HOST_DIR="${WORKER2_NCCL_HOST_DIR:-$WORKER2_HOME/nccl-2.30.7}"
@@ -300,6 +307,17 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-dense,kda}"
 # here is on the TP=2 path. Empty disables them, which will not boot at TP=3.
 TP3_OVERLAY_HOST="${TP3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/tp3}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Direct-I/O safetensors on the published InstantTensor image. Unset follows
+# IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
+# PREFIX_MATCH_UNIT empty = vLLM default hash grain.
+# 512 is illegal on this hybrid stack (KDA align block is 64).
+if [ -z "${LOAD_FORMAT+x}" ]; then
+    case "$IMAGE" in
+        *instanttensor*) LOAD_FORMAT=instanttensor ;;
+        *) LOAD_FORMAT= ;;
+    esac
+fi
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
@@ -1017,7 +1035,7 @@ pull_image() {
     log "pulling ${IMAGE} ..."
     docker pull "$IMAGE" && return 0
     die "docker pull ${IMAGE} failed.
-  :exl3 is a public GHCR package — check network / disk.
+  :exl3-instanttensor is a public GHCR package — check network / disk.
   If you still get 401/403: echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
   Overlay rebuild: BUILD=1 ./start.sh. Recipe-stamp drift also rebuilds; SKIP_BUILD=1 keeps GHCR."
 }
@@ -1397,6 +1415,8 @@ fi
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
 spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
@@ -1530,6 +1550,8 @@ fi
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ "${SPEC_METHOD:-mtp}" = "dflash" ]; then
     ARGS+=(--speculative-config "$(python3 -S -c 'import json,os
 spec={"method":"dflash","model":os.environ["DFLASH_MODEL_DIR"],"num_speculative_tokens":int(os.environ.get("DFLASH_TOKENS","7")),"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}
@@ -1712,6 +1734,7 @@ TP3_SKIP_OLD_SCP
         -e "NCCL_BUFFSIZE=$NCCL_BUFFSIZE"
         -e "NCCL_LL128_BUFFSIZE=$NCCL_LL128_BUFFSIZE"
         -e "NCCL_PROTO=$NCCL_PROTO"
+        -e "NCCL_MIN_NCHANNELS=$NCCL_MIN_NCHANNELS"
         -e "NCCL_MAX_NCHANNELS=$NCCL_MAX_NCHANNELS"
         -e NCCL_IGNORE_CPU_AFFINITY=1
         -e "NCCL_DEBUG=$NCCL_DEBUG"
@@ -1743,6 +1766,9 @@ TP3_SKIP_OLD_SCP
         -e PYTHONFAULTHANDLER=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    [[ "$NCCL_MIN_NCHANNELS" =~ ^[1-9][0-9]*$ && "$NCCL_MAX_NCHANNELS" =~ ^[1-9][0-9]*$ ]] \
+        || die "NCCL_MIN/MAX_NCHANNELS must be positive integers (got MIN=${NCCL_MIN_NCHANNELS} MAX=${NCCL_MAX_NCHANNELS})"
+    log "NCCL channels pinned MIN=${NCCL_MIN_NCHANNELS} MAX=${NCCL_MAX_NCHANNELS} (all ranks)"
     local worker_nccl="" e
     for e in "${nccl_common[@]}"; do
         [ "$e" = "-e" ] && continue
@@ -1768,11 +1794,12 @@ TP3_SKIP_OLD_SCP
              DFLASH_DRAFT_TP DFLASH_REVISION \
              SOCKET_IFNAME HEAD_SOCKET_IFNAME WORKER_SOCKET_IFNAME WORKER2_SOCKET_IFNAME \
              HEAD_HOST_IP WORKER_HOST_IP WORKER2_HOST_IP NCCL_IB_SUBNET_AWARE_ROUTING \
-             NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_BUFFSIZE NCCL_LL128_BUFFSIZE NCCL_PROTO NCCL_MAX_NCHANNELS \
+             NCCL_P2P_DISABLE NCCL_SHM_DISABLE NCCL_BUFFSIZE NCCL_LL128_BUFFSIZE NCCL_PROTO NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              MM_IMAGE_TOKENS VIDEO_NUM_FRAMES MM_PROCESSOR_CACHE_GB MM_ENCODER_TP_MODE \
              TP3_HEAD_OVERRIDE ENABLE_EXPERT_PARALLEL \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MODEL_DIR EXTRA_ARGS \
+             LOAD_FORMAT PREFIX_MATCH_UNIT \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8; do
@@ -1889,7 +1916,10 @@ TP3_SKIP_OLD_SCP
         -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
         -e LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}" \
-        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
+        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" \
+        -e LOAD_FORMAT="${LOAD_FORMAT:-}" \
+        -e PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}" \
+        -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
         -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
         -e DFLASH_MODEL_DIR="${DFLASH_MODEL_DIR:-}" \

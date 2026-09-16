@@ -1041,7 +1041,7 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
-def _strip_helper(text: str, label: str) -> str:
+def _strip_helper(text: str, label: str, *, expected: str | None = None) -> str:
     start = text.find("class _Glm53MixedPrefill:")
     if start < 0:
         raise SystemExit(f"{P}: {label} helper start not found")
@@ -1053,6 +1053,8 @@ def _strip_helper(text: str, label: str) -> str:
     if not candidates:
         raise SystemExit(f"{P}: {label} helper end not found")
     end = min(candidates)
+    if expected is not None and text[start:end].strip() != expected.strip():
+        raise SystemExit(f"{P}: {label} helper drifted")
     return text[:start] + text[end:]
 
 
@@ -1185,7 +1187,7 @@ V6_PAIRS = tuple((_v6_new(new, label), old, label) for new, old, label in V5_PAI
 def unpatch_v5(text: str) -> str:
     for new, old, label in V5_PAIRS:
         text = replace_once(text, new, old, label)
-    text = _strip_helper(text, "v5")
+    text = _strip_helper(text, "v5", expected=_helper_text())
     if MARK_V5 in text:
         raise SystemExit(f"{P}: v5 leftover after unpatch")
     return text
@@ -1205,7 +1207,7 @@ def apply_v5(text: str) -> str:
 def unpatch_v6(text: str) -> str:
     for new, old, label in V6_PAIRS:
         text = replace_once(text, new, old, label)
-    text = _strip_helper(text, "v6")
+    text = _strip_helper(text, "v6", expected=_helper_text())
     if MARK_V6 in text:
         raise SystemExit(f"{P}: v6 leftover after unpatch")
     return text
@@ -1228,13 +1230,20 @@ def main() -> int:
     text = P.read_text()
     original = text
     if MARK_V6 in text:
-        clean = unpatch_v6(text)
-        rebuilt = apply_v6(clean)
-        if rebuilt != text:
-            P.write_text(rebuilt)
-            print(f"{P.name}: {MARK_V6} helper refreshed")
-        else:
-            print(f"{P.name}: {MARK_V6} already present — verified")
+        # Validate existing anchors/helper instead of trusting the marker alone.
+        # unpatch_v6 checks every v6 insertion occurs exactly once, requires the
+        # helper region verbatim, and rejects leftover markers. Its result is
+        # discarded: patch_adaptive_k.py legitimately inserts its own helper
+        # between this one and the cuda_graph import anchor, so re-applying at
+        # that fixed anchor would relocate the helper and fail a byte-compare on
+        # a healthy file (upstream #198, the same bug on v5).
+        unpatch_v6(text)
+        # The import edit is part of the applied state; the byte-compare used
+        # to cover it implicitly.
+        if "import os\n" not in text.split("import time\n", 1)[0]:
+            raise SystemExit(f"{P}: v6 import drifted")
+        compile(text, str(P), "exec")
+        print(f"{P.name}: {MARK_V6} already present — verified")
         return 0
     if MARK_V5 in text:
         text = unpatch_v5(text)

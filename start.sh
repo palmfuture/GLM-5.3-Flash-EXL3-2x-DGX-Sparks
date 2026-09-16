@@ -17,7 +17,8 @@
 #
 # What we do:
 #   1. preflight  — docker/ssh/disk on both nodes
-#   2. image      — docker pull IMAGE from GHCR (public :exl3 tag). If the
+#   2. image      — docker pull IMAGE from GHCR (public :exl3-instanttensor
+#                   tag). If the
 #                   worker is missing that digest, try docker pull there,
 #                   then fall back to docker save --platform | ssh docker
 #                   load (issue #8). SKIP_PULL=1 keeps a local copy.
@@ -119,7 +120,7 @@ case "$GLM53_MODEL_PRESET" in
         exit 2
         ;;
 esac
-IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
+IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
 SERVED_MODEL_ALIASES="${SERVED_MODEL_ALIASES:-}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
@@ -140,6 +141,9 @@ WORKER_CX7_IF="${WORKER_CX7_IF:-enp1s0f0np0}"
 HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"
 WORKER_CX7_IB="${WORKER_CX7_IB:-rocep1s0f0}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+# Empty = let NCCL pick the channel count. A positive integer pins both
+# NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS on both ranks (Entrpi 2× Spark: 8).
+NCCL_NCHANNELS="${NCCL_NCHANNELS:-}"
 NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # The RoCEv2 GID index is per-NIC: the usable entry is the one whose GID matches
 # that node's own fabric IP. Most pairs share a good index; some do not (this kit
@@ -225,6 +229,16 @@ DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Direct-I/O safetensors on the published InstantTensor image. Unset follows
+# IMAGE (*instanttensor* → on). Explicit empty (LOAD_FORMAT=) is vLLM auto.
+# PREFIX_MATCH_UNIT empty = vLLM default hash grain.
+if [ -z "${LOAD_FORMAT+x}" ]; then
+    case "$IMAGE" in
+        *instanttensor*) LOAD_FORMAT=instanttensor ;;
+        *) LOAD_FORMAT= ;;
+    esac
+fi
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
 QUANTIZATION="${QUANTIZATION:-exl3}"
 LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-0}"
 SKIP_MM_PROFILING="${SKIP_MM_PROFILING:-1}"
@@ -1181,7 +1195,7 @@ pull_image() {
     log "pulling ${IMAGE} ..."
     docker pull "$IMAGE" && return 0
     die "docker pull ${IMAGE} failed.
-  :exl3 is a public GHCR package — check network / disk.
+  :exl3-instanttensor is a public GHCR package — check network / disk.
   If you still get 401/403: echo YOUR_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
   Overlay rebuild: BUILD=1 ./start.sh. Recipe-stamp drift also rebuilds; SKIP_BUILD=1 keeps GHCR."
 }
@@ -1593,6 +1607,8 @@ ARGS=(
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
     ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
@@ -1671,6 +1687,8 @@ ARGS=(
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ] && ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 [ -n "${LONG_PREFILL_TOKEN_THRESHOLD:-}" ] && ARGS+=(--long-prefill-token-threshold "${LONG_PREFILL_TOKEN_THRESHOLD}")
 [ -n "${KV_CACHE_DTYPE:-}" ] && ARGS+=(--kv-cache-dtype "${KV_CACHE_DTYPE}")
+[ -n "${LOAD_FORMAT:-}" ] && ARGS+=(--load-format "${LOAD_FORMAT}")
+[ -n "${PREFIX_MATCH_UNIT:-}" ] && ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [ -n "${GLM53_DEFAULT_REASONING_EFFORT:-}" ]; then
     ARGS+=(--default-chat-template-kwargs "{\"reasoning_effort\":\"${GLM53_DEFAULT_REASONING_EFFORT}\"}")
 fi
@@ -1811,6 +1829,14 @@ launch_cluster() {
         -e DO_NOT_TRACK=1
         -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$CG_ESTIMATE"
     )
+    if [ -n "${NCCL_NCHANNELS:-}" ]; then
+        [[ "$NCCL_NCHANNELS" =~ ^[1-9][0-9]*$ ]] || die "NCCL_NCHANNELS must be a positive integer (got ${NCCL_NCHANNELS})"
+        nccl_common+=(
+            -e "NCCL_MIN_NCHANNELS=$NCCL_NCHANNELS"
+            -e "NCCL_MAX_NCHANNELS=$NCCL_NCHANNELS"
+        )
+        log "NCCL channels pinned MIN=MAX=${NCCL_NCHANNELS} (both ranks)"
+    fi
     log "per-request prefix-cache no-store flag: GLM53_APC_NO_STORE=${GLM53_APC_NO_STORE} (both ranks)"
     log "boot KV-capacity breakdown log: GLM53_KV_CAPACITY_LOG=${GLM53_KV_CAPACITY_LOG} (both ranks)"
     # Global sparse retention is implemented by the pinned vLLM runtime.  Full
@@ -1849,7 +1875,7 @@ launch_cluster() {
     for v in SERVED_MODEL_NAME SERVED_MODEL_ALIASES PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
              LONG_PREFILL_TOKEN_THRESHOLD \
-             KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
+             KV_CACHE_DTYPE LOAD_FORMAT PREFIX_MATCH_UNIT MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
              DFLASH_DRAFT_TP \
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              MM_IMAGE_TOKENS VIDEO_NUM_FRAMES MM_PROCESSOR_CACHE_GB \
@@ -2004,7 +2030,10 @@ launch_cluster() {
         -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
         -e DEFAULT_MAX_NEW_TOKENS="$DEFAULT_MAX_NEW_TOKENS" \
         -e LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-}" \
-        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" -e MTP_TOKENS="$MTP_TOKENS" \
+        -e KV_CACHE_DTYPE="$KV_CACHE_DTYPE" \
+        -e LOAD_FORMAT="${LOAD_FORMAT:-}" \
+        -e PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}" \
+        -e MTP_TOKENS="$MTP_TOKENS" \
         -e SPEC_METHOD="$SPEC_METHOD" \
         -e DFLASH_TOKENS="${DFLASH_TOKENS:-7}" \
         -e DFLASH_MODEL_DIR="${DFLASH_MODEL_DIR:-}" \

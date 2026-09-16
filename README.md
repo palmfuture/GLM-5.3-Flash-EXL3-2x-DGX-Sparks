@@ -270,7 +270,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888**. Open by default; set `VLLM_API_KEY` for optional Bearer auth |
 | Weights | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (mirror of `brandonmusic/…` snapshot `5ab363a8…`) |
 | Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`). Optional aliases via `SERVED_MODEL_ALIASES` |
-| Image | Experimental: `ghcr.io/palmfuture/glm53-exl3-stable:dev` (do not tag experiments as `ghcr.io/miaai-lab/...:exl3`). Upstream public: `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
+| Image | Experimental: `ghcr.io/palmfuture/glm53-exl3-stable:dev` (do not tag experiments as `ghcr.io/miaai-lab/...:exl3`), built from this Dockerfile so InstantTensor 0.2.0 is baked in and `--load-format instanttensor` works. Upstream public: `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor`, or wheel-less `:exl3` (then `LOAD_FORMAT=` empty), both FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
 | Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
 | Head | this machine, `HEAD_IP=10.0.0.1`, container `glm53-exl3-head` |
 | Worker | `WORKER_USER@WORKER_IP` (this kit: `zurih@10.0.0.2`), `--headless`, `glm53-exl3-worker` |
@@ -667,7 +667,7 @@ git clone https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks.git
 cd GLM-5.3-Flash-EXL3-2x-DGX-Sparks
 cp .env.example .env          # edit HEAD_IP / WORKER_IP / WORKER_USER if needed
 ./download.sh                 # optional: EXL3 + DFlash2 into the head HF cache only
-./start.sh                    # pull public GHCR :exl3, download if missing, share or rsync weights, launch TP=2
+./start.sh                    # pull public GHCR :exl3-instanttensor, download if missing, share or rsync weights, launch TP=2
 ```
 
 First run of `./start.sh` copies `.env.example` → `.env` if missing. Prefix env
@@ -697,7 +697,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies. A failed pull is fatal *after* both containers have already been stopped, so the serve stays down until you rerun: if you point `IMAGE` at a private package, either `docker login ghcr.io` on the head or keep `SKIP_PULL=1` in `.env`. A matching recipe stamp is what sends a restart down the pull path at all — a restart that follows an `overlay/` or Dockerfile edit rebuilds locally instead and never notices.
+2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies. A failed pull is fatal *after* both containers have already been stopped, so the serve stays down until you rerun: if you point `IMAGE` at a private package, either `docker login ghcr.io` on the head or keep `SKIP_PULL=1` in `.env`. A matching recipe stamp is what sends a restart down the pull path at all — a restart that follows an `overlay/` or Dockerfile edit rebuilds locally instead and never notices.
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. Put the cache on the worker: **`NFS_SHARE=1`** (this kit) mounts the head's
    HF cache read-only over NFSv4 on ConnectX; otherwise `rsync` a full copy to
@@ -1008,7 +1008,8 @@ that are now documented/enforced:
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | Primary OpenAI `model` id (`/v1/models`) |
 | `SERVED_MODEL_ALIASES` | *(empty)* | Extra `--served-model-name` ids (space-separated, quote in `.env`). Example: `"GLM-5.3-Flash claude-GLM-5.3-Flash"` |
-| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull |
+| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3`. This fork serves from `ghcr.io/palmfuture/glm53-exl3-stable:dev`, which is private — a pull needs `docker login ghcr.io` or `SKIP_PULL=1` |
+| `LOAD_FORMAT` | `instanttensor` when `IMAGE` contains `instanttensor`; else empty | `--load-format`. Direct-I/O safetensors. Explicit empty (`LOAD_FORMAT=`) restores vLLM auto. Required empty on the wheel-less `:exl3` tag. A locally built tag carries the wheel whatever it is named, so set it explicitly there |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
