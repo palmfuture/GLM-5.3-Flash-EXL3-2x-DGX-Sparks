@@ -1187,7 +1187,10 @@ V6_PAIRS = tuple((_v6_new(new, label), old, label) for new, old, label in V5_PAI
 def unpatch_v5(text: str) -> str:
     for new, old, label in V5_PAIRS:
         text = replace_once(text, new, old, label)
-    text = _strip_helper(text, "v5", expected=_helper_text())
+    # No expected= here, unlike upstream: they verify a live v5 install, this branch
+    # only migrates one to v6. _helper_text() emits v6 markers, so a helper that
+    # could match it would already have been caught by the MARK_V6 branch above.
+    text = _strip_helper(text, "v5")
     if MARK_V5 in text:
         raise SystemExit(f"{P}: v5 leftover after unpatch")
     return text
