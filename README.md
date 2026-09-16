@@ -205,6 +205,38 @@ cannot. Consequences worth knowing before benchmarking prose:
 
 Receipts: `logs/decode-1m-20260916/`.
 
+#### InstantTensor at 1M: 12x faster load, 4-5 GiB less headroom (2026-09-16)
+
+`LOAD_FORMAT=instanttensor` (upstream #200) is off on this kit. Same image
+(`glm53.recipe.stamp aa54e2db09ae`), one variable, `MemAvailable` sampled at the same two
+points on both nodes:
+
+| | `LOAD_FORMAT=` empty | `instanttensor` |
+|---|---:|---:|
+| weight load | 120 shards, **312 s** | 164 GB @ 6.6 GB/s, **26 s** |
+| idle after `/health`, head | **5.16 GiB** | **1.35 GiB** |
+| idle after `/health`, worker | **7.31 GiB** | **2.37 GiB** |
+| after the decode benches, head | 5.10 | 1.57 |
+| after the decode benches, worker | 7.32 | 3.88 |
+| prose / structured tok/s | 31.27 / 69.50 | 29.93 / 68.81 |
+
+The cost is already there at idle, so it is held for the life of the process rather than
+released after the load. It is not pinned host memory — `Mlocked` stays at 24 MB and
+`AnonPages` matches process RSS — so the 4-5 GiB per node sits in the device allocator,
+which `nvidia-smi` cannot break down on GB10 (it reports `[N/A]` for memory on UMA).
+Under it both nodes were in swap (head 1.3 GiB, worker 3.1 GiB) and both decode numbers
+moved down together. Stopping the serve returns everything (116.9 / 116.0 GiB), so this is
+not a leak outside the containers.
+
+Saving 4.7 minutes of boot is not worth that headroom at `MAX_MODEL_LEN=1048576` on this
+UMA. The KV pin is not involved — it is identical in both arms, and `--kv-cache-memory-bytes`
+already bypasses `GPU_MEM_UTIL` by design (the boot log says so). Re-test before enabling it
+at a shorter context.
+
+`NCCL_NCHANNELS` is off for the opposite reason: on the same image it measured prose
+32.31 vs 31.49 and structured 69.21 vs 70.53 against no pin — opposite directions, both
+inside the run-to-run spread. The value 8 comes from a different kit; nothing here reproduces it.
+
 Re-measure:
 
 ```bash
@@ -1009,7 +1041,7 @@ that are now documented/enforced:
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | Primary OpenAI `model` id (`/v1/models`) |
 | `SERVED_MODEL_ALIASES` | *(empty)* | Extra `--served-model-name` ids (space-separated, quote in `.env`). Example: `"GLM-5.3-Flash claude-GLM-5.3-Flash"` |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3`. This fork serves from `ghcr.io/palmfuture/glm53-exl3-stable:dev`, which is private — a pull needs `docker login ghcr.io` or `SKIP_PULL=1` |
-| `LOAD_FORMAT` | `instanttensor` when `IMAGE` contains `instanttensor`; else empty | `--load-format`. Direct-I/O safetensors. Explicit empty (`LOAD_FORMAT=`) restores vLLM auto. Required empty on the wheel-less `:exl3` tag. A locally built tag carries the wheel whatever it is named, so set it explicitly there |
+| `LOAD_FORMAT` | *(empty on this kit)* | `--load-format`. Direct-I/O safetensors. Required empty on the wheel-less `:exl3` tag; a locally built tag carries the wheel whatever it is named, so set it explicitly there. **Left off at 1M here**: 12x faster weight load, but ~4-5 GiB less host headroom per node and both nodes into swap — see *InstantTensor at 1M* |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
