@@ -122,7 +122,7 @@ as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the l
 
 Two decode speed-ups ship in the overlay, both **off by default** (matched A/B/A at 131k and 850k, 8 runs per prompt, bootstrap 95 % CI; receipts in `logs/overnight-decode-20260907T224521Z/`):
 
-- **Adaptive verification length** (`GLM53_ADAPTIVE_K=ema`): the DFlash2 drafter still proposes 7 tokens, but the scheduler verifies only a per-step prefix (2, 4 or 7) chosen from a running average of how many drafts have been surviving, batch-uniform so every decode step keeps its FULL CUDA graph. Lossless at temperature 0. Measured vs stock k=7 (8 runs/prompt, 131k and 850k): Silk Road essay +21 %, sky/sunset +13 %, hash-map +10 %, code +5–15 %, counting unchanged.
+- **Adaptive verification length** (`GLM53_ADAPTIVE_K=ema`): the DFlash2 drafter still proposes 7 tokens, but the scheduler verifies only a per-step prefix (2, 4 or 7) chosen from a running average of how many drafts have been surviving, batch-uniform so every decode step keeps its FULL CUDA graph (`GLM53_ADAPTIVE_K_BATCH` picks which length a mixed batch settles on). Lossless at temperature 0. Measured vs stock k=7 (8 runs/prompt, 131k and 850k): Silk Road essay +21 %, sky/sunset +13 %, hash-map +10 %, code +5–15 %, counting unchanged.
 - **FP8 weight-only dense projections** (`GLM53_DENSE_FP8=dense,kda`): KDA and dense-MLP projections quantised per output channel to FP8 at load and run through the Marlin kernel, ~11 ms less per step on everything (+10 % on counting, prose +12–19 % alone, **+37 % on hard prose stacked with adaptive-k**). PROVISIONAL: it changes target numerics by FP8 rounding (KL proxy vs stock 0.002–0.013 nats/position, argmax agreement 94–100 %; no full KLD panel yet).
 
 Turn on (no rebuild; the patches apply at container start on both nodes):
@@ -150,6 +150,60 @@ Structured per-pos (lab median): **0.98 / 0.98 / 0.94 / 0.94 / 0.91 / 0.83 / 0.8
 Prose per-pos: **0.75 / 0.58 / 0.41 / 0.28 / 0.16 / 0.09 / 0.06**.
 Pinning `attention_backend=TRITON_ATTN` dropped structured to ~29 tok/s / 0.31 accept
 (pos0 healthy, later positions collapsed).
+
+#### Both speed-ups at 1M on this kit (2026-09-16)
+
+`tests/bench_decode.py`, median of 5 × 400, temp 0, thinking off, TP=2, `MAX_MODEL_LEN=1048576`,
+KV pinned at 1.05x, `GLM53_ADAPTIVE_K=ema` set `2,4,7` + `GLM53_DENSE_FP8=dense,kda`:
+
+| Bench | stock k=7 / BF16 | both on | Δ |
+|---|---:|---:|---:|
+| Prose (hash-map) | 27.97 tok/s, 0.368 accept, 2.575/step | **33.52**, 0.546, 2.27/step | **+19.8 %** |
+| Structured (count) | 65.1 (2026-08-30 lab ref) | **69.77**, 0.9588, 6.712/step | +7.2 %, accept unchanged |
+
+Prose verified length settles at ~4.1 of 7: the policy gives up ~0.3 accepted tokens per step and
+buys back three verify slots. Structured is never trimmed (6.712 accepted per step, verified length 7.0).
+
+**Which rung does not matter.** Interleaved A/B on one boot, 8 prose runs per arm, paired per round
+against k=7 in the same round: candidate 3 **+1.90** tok/s (t 6.04), 4 **+1.98** (t 3.48), 5 **+1.88**
+(t 3.86), 4 at `alpha=0.10` **+2.69** (t 3.27). Every arm beats k=7; none of them beat each other at
+this sample size. The optimum is a plateau at verified length 4.2–4.7, not one rung — booting with
+`GLM53_ADAPTIVE_K_SET=2,3,4,5,7` to reach it costs a 16th capture size and two more uniform decode
+graphs (~3.4 GiB of host headroom at 1M here) and returns nothing. Stay on `2,4,7`.
+
+**Keep the full draft length in the set.** `GLM53_ADAPTIVE_K_SET=2,4` caps *every* stream at 4:
+structured fell from ~70 to 53.9 tok/s (4.195 accepted per step).
+
+**`GLM53_ADAPTIVE_K_BATCH` (mixed batches only).** One prose + one structured stream in flight,
+4 paired rounds:
+
+| | prose tok/s | structured tok/s | verified len |
+|---|---:|---:|---:|
+| each alone | 32.78 | 70.69 | — |
+| shared step, `batch=min` | 25.31 | 37.48 | 4.13 |
+| shared step, `batch=max` | 25.65 | **46.83** | 5.79 |
+
+Paired structured difference per round: +8.94 / +8.82 / +9.81 / +8.97 (mean **+9.14**). Prose paired
+difference is noise (mean +0.32). Under `min` a prose stream's EMA sets the length for the whole step,
+so the structured stream sharing it verifies 4 instead of 7 and loses a third of its throughput. Solo
+decode is identical either way. `max` is the better default for mixed serving; `min` is kept as the
+default so the knob changes nothing until it is set.
+
+**Why prose is the hard case.** Target top1−top2 gap over prose text: median 1.50 nats, 25.8 % of
+positions under 0.5, 4.1 % under 0.1. Over the counting text: median 5.94 nats, 0.5 % under 0.5, none
+under 0.1. The drafter has to match the target's argmax exactly, so prose rejects where structured
+cannot. Consequences worth knowing before benchmarking prose:
+
+- **Prose is not reproducible at temperature 0** — six runs of one prompt gave six different outputs
+  (accept 0.306–0.390). The same protocol on the counting prompt gave four byte-identical outputs at
+  1.00 accept. Compare prose configurations on medians of ≥5 runs, never single runs.
+- **Context length does not move acceptance; content in the drafter's window does.** The DFlash2
+  drafter is `sliding_window: 2048`, so it never sees more than the last 2048 tokens. Coherent 8k and
+  32k prefixes measured 0.31–0.40 accept, the same band as a 33-token prompt; random-word filler of
+  the same length measured 0.17–0.23.
+- **Temperature is not the driver** — 0, 0.7 and 1.0 all landed in 0.26–0.43.
+
+Receipts: `logs/decode-1m-20260916/`.
 
 Re-measure:
 
@@ -643,7 +697,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies.
+2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies. A failed pull is fatal *after* both containers have already been stopped, so the serve stays down until you rerun: if you point `IMAGE` at a private package, either `docker login ghcr.io` on the head or keep `SKIP_PULL=1` in `.env`. A matching recipe stamp is what sends a restart down the pull path at all — a restart that follows an `overlay/` or Dockerfile edit rebuilds locally instead and never notices.
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. Put the cache on the worker: **`NFS_SHARE=1`** (this kit) mounts the head's
    HF cache read-only over NFSv4 on ConnectX; otherwise `rsync` a full copy to
@@ -961,7 +1015,8 @@ that are now documented/enforced:
 | `GLM53_EXPOSE_CACHE_RESET` | `0` (off) | opt-in. `1` attaches the upstream cache-reset dev routes (`/reset_prefix_cache`, `/reset_mm_cache`, `/reset_encoder_cache`, #31) on the head API server. This flag does not enable other dev routes; independent `VLLM_SERVER_DEV_MODE` retains precedence and can enable the full dev surface. Root routes are outside the bearer guard—leave this flag off where clients are untrusted. Takes effect on restart. TP=2 `start.sh` only; `start-tp3.sh` / `start-tp4.sh` are unchanged |
 | `ABLIT` | `0` (off) | opt-in. `1` = apply o_proj edit at load on both ranks. Unset leaves checkpoint weights unchanged |
 | `GLM53_ADAPTIVE_K` | `off` | `ema` = adaptive verification length (prose +13–21 %); needs the capture-size list in `EXTRA_ARGS`. See *Faster prose decode* |
-| `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1 |
+| `GLM53_ADAPTIVE_K_SET` | `2,4,7` | candidate draft lengths; graphs are captured for each length + 1. Keep the full draft length in the set — dropping it trims structured decode too (measured: `2,4` cost structured 70 → 54 tok/s) |
+| `GLM53_ADAPTIVE_K_BATCH` | `min` | how one uniform length is chosen for a mixed batch. `min` = the shortest any running request wants, so a prose stream also trims a structured stream sharing the step. `max` = the longest, so trimming happens only when every running request agrees; solo requests are unaffected either way |
 | `GLM53_DENSE_FP8` | `off` | `dense,kda` = FP8 weight-only (Marlin) dense projections, ~-11 ms/step; PROVISIONAL numerics. Groups: `shared,dense,kda,mla` |
 | `ABLIT_METHOD` | `auto` | `auto` = transplant when `ablit/transplant/` is populated, else `proj` |
 | `ABLIT_LAYERS` | `15-45` | inclusive range; `45` is the checkpoint MTP block |
