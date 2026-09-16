@@ -121,6 +121,7 @@ case "$GLM53_MODEL_PRESET" in
 esac
 IMAGE="${IMAGE:-ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-EXL3}"
+SERVED_MODEL_ALIASES="${SERVED_MODEL_ALIASES:-}"
 GHCR_USER="${GHCR_USER:-MiaAI-Lab}"
 
 HEAD_IP="${HEAD_IP:-10.0.0.1}"
@@ -1566,7 +1567,7 @@ set -euo pipefail
 say() { echo "[glm53-exl3-head] $*"; }
 
 ARGS=(
-    --served-model-name "${SERVED_MODEL_NAME}"
+    --served-model-name "${SERVED_MODEL_NAME}" ${SERVED_MODEL_ALIASES:-}
     --host 0.0.0.0
     --port "${PORT}"
     --tensor-parallel-size "${TP}"
@@ -1643,7 +1644,7 @@ set -euo pipefail
 say() { echo "[glm53-exl3-worker] $*"; }
 
 ARGS=(
-    --served-model-name "${SERVED_MODEL_NAME}"
+    --served-model-name "${SERVED_MODEL_NAME}" ${SERVED_MODEL_ALIASES:-}
     --host 0.0.0.0
     --port "${PORT}"
     --tensor-parallel-size "${TP}"
@@ -1842,7 +1843,7 @@ launch_cluster() {
     local serve_env=""
     local -a serve_env_names=()
     local v
-    for v in SERVED_MODEL_NAME PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
+    for v in SERVED_MODEL_NAME SERVED_MODEL_ALIASES PORT TP NNODES HEAD_IP MASTER_PORT QUANTIZATION \
              MAX_MODEL_LEN GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
              LONG_PREFILL_TOKEN_THRESHOLD \
              KV_CACHE_DTYPE MTP_TOKENS SPEC_METHOD DFLASH_TOKENS DFLASH_MODEL_DIR \
@@ -1990,6 +1991,7 @@ launch_cluster() {
         -e NCCL_IB_GID_INDEX="$HEAD_GID" \
         -e VLLM_HOST_IP="$HEAD_IP" \
         -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
+        -e SERVED_MODEL_ALIASES="${SERVED_MODEL_ALIASES:-}" \
         -e PORT="$PORT" -e TP="$TP" -e NNODES="$NNODES" \
         -e HEAD_IP="$HEAD_IP" -e MASTER_PORT="$MASTER_PORT" \
         -e QUANTIZATION="$QUANTIZATION" \

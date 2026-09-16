@@ -215,7 +215,7 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 |---|---|
 | API | vLLM OpenAI (`/v1/chat/completions`) on the head, port **8888**. Open by default; set `VLLM_API_KEY` for optional Bearer auth |
 | Weights | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (mirror of `brandonmusic/…` snapshot `5ab363a8…`) |
-| Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`) |
+| Model id | `GLM-5.3-Flash-EXL3` (`--served-model-name`). Optional aliases via `SERVED_MODEL_ALIASES` |
 | Image | Experimental: `ghcr.io/palmfuture/glm53-exl3-stable:dev` (do not tag experiments as `ghcr.io/miaai-lab/...:exl3`). Upstream public: `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` FROM `vllm/vllm-openai:glm53-flash-arm64-cu130@sha256:905c0293…` (arm64, CUDA 13.0) |
 | Executor | `mp`, `--nnodes 2`, `--tensor-parallel-size 2` |
 | Head | this machine, `HEAD_IP=10.0.0.1`, container `glm53-exl3-head` |
@@ -952,7 +952,8 @@ that are now documented/enforced:
 | `WORKER_HOME` | `$HOME` if same user, else `/home/$WORKER_USER` | worker HF cache |
 | `MODEL` | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | Hub repo into the HF cache (mirror) |
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
-| `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | OpenAI `model` id (`/v1/models`) |
+| `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | Primary OpenAI `model` id (`/v1/models`) |
+| `SERVED_MODEL_ALIASES` | *(empty)* | Extra `--served-model-name` ids (space-separated, quote in `.env`). Example: `"GLM-5.3-Flash claude-GLM-5.3-Flash"` |
 | `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` | public GHCR tag. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
