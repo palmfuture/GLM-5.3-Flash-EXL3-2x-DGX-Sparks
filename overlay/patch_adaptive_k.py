@@ -18,10 +18,16 @@ Knobs (all read at runtime inside the container):
                               was accepted: "max" (default: the full draft length,
                               so the EMA can climb back above the current n) or
                               "n" (the accepted count itself; ratchets downward)
+  GLM53_ADAPTIVE_K_BATCH      how one uniform length is picked for a mixed batch:
+                              "min" (default: the shortest any running request wants, so a
+                              prose stream also trims a structured stream sharing the step)
+                              or "max" (the longest, so no request is verified shorter than
+                              its own EMA asked for; the batch is then only trimmed when
+                              every running request agrees it can be)
   GLM53_ADAPTIVE_K_HIST       print the chosen-length histogram every N steps, 200
   GLM53_ADAPTIVE_K_FILE       runtime override JSON (default /root/.cache/vllm/glm53_adaptive_k.json,
                               i.e. <CACHE_ROOT>/glm53_adaptive_k.json on the head): keys mode, alpha,
-                              margin, set (clamped to the boot-time set), saturate, min_steps.
+                              margin, set (clamped to the boot-time set), saturate, min_steps, batch.
                               Re-read when its mtime changes (checked every 50 steps). Only honoured
                               when the knob was on at boot (graphs exist for the boot-time lengths).
 
@@ -68,6 +74,7 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
         raw = _e("GLM53_ADAPTIVE_K_SET", "2,4,7")
         self.k_set = sorted({int(x) for x in raw.split(",") if x.strip()})
         self.saturate = _e("GLM53_ADAPTIVE_K_SATURATE", "max").lower()
+        self.batch_policy = _e("GLM53_ADAPTIVE_K_BATCH", "min").lower()
         self.hist_every = int(_e("GLM53_ADAPTIVE_K_HIST", "200"))
         self.state: dict[str, list[float]] = {}  # req_id -> [ema, observed_steps]
         self.hist: dict[int, int] = {}
@@ -84,7 +91,8 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
         if self.enabled:
             print(
                 f"[glm53-adaptive-k] enabled set={self.k_set} alpha={self.alpha} "
-                f"margin={self.margin} min_steps={self.min_steps} saturate={self.saturate}",
+                f"margin={self.margin} min_steps={self.min_steps} saturate={self.saturate} "
+                f"batch={self.batch_policy}",
                 flush=True,
             )
 
@@ -110,6 +118,7 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
             self.margin = float(cfg.get("margin", self.margin))
             self.min_steps = int(cfg.get("min_steps", self.min_steps))
             self.saturate = str(cfg.get("saturate", self.saturate)).strip().lower()
+            self.batch_policy = str(cfg.get("batch", self.batch_policy)).strip().lower()
             if "set" in cfg:
                 want = {int(x) for x in (cfg["set"] if isinstance(cfg["set"], list) else str(cfg["set"]).split(","))}
                 self.k_set = sorted(want & set(self.boot_set)) or list(self.boot_set)
@@ -117,7 +126,8 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
             self.hist.clear()
             print(
                 f"[glm53-adaptive-k] reloaded {self.file}: enabled={self.enabled} set={self.k_set} "
-                f"alpha={self.alpha} margin={self.margin} min_steps={self.min_steps} saturate={self.saturate}",
+                f"alpha={self.alpha} margin={self.margin} min_steps={self.min_steps} "
+                f"saturate={self.saturate} batch={self.batch_policy}",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -150,6 +160,11 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
         n = max(cands) if cands else min(self.k_set)
         return max(1, min(n, k))
 
+    def _reduce(self, ns):
+        """One uniform length for the batch. "max" never verifies a request shorter
+        than its own EMA asked for, so a prose stream cannot trim a structured one."""
+        return max(ns) if self.batch_policy == "max" else min(ns)
+
     def apply(self, reqs, live_ids) -> None:
         """reqs: list of (request, structured). Trims spec_token_ids to a uniform n.
 
@@ -167,7 +182,7 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
                 ns = None
                 break
             ns.append(n_i)
-        n = max(len(r.spec_token_ids) for r, _ in reqs) if ns is None else min(ns)
+        n = max(len(r.spec_token_ids) for r, _ in reqs) if ns is None else self._reduce(ns)
         for r, _ in reqs:
             if len(r.spec_token_ids) > n:
                 r.spec_token_ids = r.spec_token_ids[:n]
@@ -175,9 +190,9 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
 
     def batch_k(self, k: int, reqs, live_ids) -> int:
         """Schedule-time hook (async scheduler): the number of draft slots every
-        request gets on the next step. Minimum over the scheduled decode
-        requests; any structured-output or not-yet-observed request pins the
-        batch at k."""
+        request gets on the next step. Reduced over the scheduled decode requests
+        by GLM53_ADAPTIVE_K_BATCH (min default, max opt-in); any structured-output
+        or not-yet-observed request pins the batch at k."""
         if self.steps % 50 == 0:
             self._reload()
         if not self.enabled or k <= 0:
@@ -192,7 +207,7 @@ class _Glm53AdaptiveK:  # [glm53-adaptive-k]
                 ns = None
                 break
             ns.append(n_i)
-        n = k if not ns else min(ns)
+        n = k if not ns else self._reduce(ns)
         self._count(n, live_ids)
         return n
 

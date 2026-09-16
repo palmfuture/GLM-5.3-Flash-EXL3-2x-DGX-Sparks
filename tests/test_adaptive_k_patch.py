@@ -164,6 +164,31 @@ def policy_tests(helper_src: str) -> None:
     p.apply([(a, False), (b, False)], {"a": a, "b": b})
     assert len(a.spec_token_ids) == 2 and len(b.spec_token_ids) == 2
 
+    # GLM53_ADAPTIVE_K_BATCH=max: the batch stays uniform, but at the *longest*
+    # length any running request asked for, so a prose stream can no longer trim
+    # the structured stream sharing its step. Solo requests are unaffected.
+    p = make({"GLM53_ADAPTIVE_K": "ema", "GLM53_ADAPTIVE_K_BATCH": "max", "GLM53_ADAPTIVE_K_HIST": "0"})
+    assert p.batch_policy == "max"
+    a, b = _SReq("a"), _SReq("b")
+    live = {"a": a, "b": b}
+    for _ in range(15):
+        p.observe("a", 7, 1); p.observe("b", 7, 7)
+    assert p.batch_k(7, [a], live) == 2, "max still trims a solo request"
+    assert p.batch_k(7, [a, b], live) == 7, "max keeps the longer length in a mixed batch"
+    ra, rb = _Req("a"), _Req("b")
+    p.apply([(ra, False), (rb, False)], {"a": ra, "b": rb})
+    assert len(ra.spec_token_ids) == 7 and len(rb.spec_token_ids) == 7
+
+    # unset knob is the documented minimum, and the override file can flip it live
+    p = make({"GLM53_ADAPTIVE_K": "ema", "GLM53_ADAPTIVE_K_HIST": "0"})
+    assert p.batch_policy == "min"
+    with _tf.TemporaryDirectory() as tmp:
+        f = os.path.join(tmp, "ak.json")
+        with open(f, "w") as fh:
+            json.dump({"mode": "ema", "batch": "max"}, fh)
+        p = make({"GLM53_ADAPTIVE_K": "ema", "GLM53_ADAPTIVE_K_HIST": "0", "GLM53_ADAPTIVE_K_FILE": f})
+        assert p.batch_policy == "max"
+
 
 def main() -> int:
     for src in (SCHED_SRC, CG_SRC):
