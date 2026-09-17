@@ -27,6 +27,9 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
 
+Release notes from the initial 1.0.0 recipe through **1.5.0** are in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
 
 `EXL3_FAT_GROUPED=1` (launcher default since 2026-09-07) replaces the E2 per-expert host loop for "fat" experts with GPU-driven launches per MoE layer built from
@@ -117,6 +120,23 @@ as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the l
 |---|---:|---:|---:|
 | **×1** | **268 ms** | **32.1** | **32.1** |
 | **×2** | 399 ms | 22.1 | 41.2 |
+
+### Opt-in cooperative decode MoE
+
+An optional decode-only cooperative EXL3 MoE overlay lives in
+[`extensions/cooperative_moe/`](extensions/cooperative_moe/). It specializes
+Turboderp's two-stage kernel for this recipe (H=4096, TP2 local I=1024, top-k 8,
+K4 MCG, 1–32 rows) and does **not** replace E3 prefill. Default image, launcher,
+and `overlay/exl3.py` stay stock until you select a generated overlay with
+`EXL3_OVERLAY_HOST`.
+
+Do not load the DS4.1 cooperative `.so` here. Serving measurements vs the
+tables above (prose ×1/×2 32.1 / 41.2 agg, structured ×1 62.9) are recorded
+after the GPU gate in [`docs/cooperative-moe.md`](docs/cooperative-moe.md).
+Live operator handoff (geometry 1, rollback, pins):
+[`docs/cooperative-moe-handoff.md`](docs/cooperative-moe-handoff.md).
+The two-node opt-in and rollback sequence is
+[`docs/cooperative-moe-quickstart.md`](docs/cooperative-moe-quickstart.md).
 
 ### Faster prose decode (opt-in, 2026-09-08)
 
@@ -683,14 +703,61 @@ took 112.49 s instead of 14.70 s, and a branch at 90% took 99.89 s instead of
 111,104. All tested answers were correct. These are sequential histories,
 not four simultaneously active 210K streams.
 
-The global launcher spelling is `GLM53_APC_RETENTION_INTERVAL` (TP=2 only).
-Leave it unset for normal use; TP=4 rejects either retention override.
+The global launcher spelling is `GLM53_APC_RETENTION_INTERVAL` (leave unset
+for a dense MLA/mamba grid). `start.sh`, `start-tp3.sh`, and `start-tp4.sh`
+all forward `GLM53_APC_RETENTION_INTERVAL_SWA`.
 
 Both retention knobs remain unset by default. Keep that default unless the
 tradeoff fits the workload. SWA-only sparse retention with a dense target is
 a separate configuration; the all-zero results do not qualify it. See the
 [protocol, raw measurements, and limitations](docs/apc-retention-qualification.md)
 before selecting a policy or a cache budget for another kit.
+
+## Existing installs: pull the InstantTensor image
+
+`main` now defaults to
+`ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor`.
+**`git pull` does not switch the running containers or a leftover `.env`.**
+If `IMAGE` is still `:exl3`, or `.env` has `SKIP_PULL=1`, you stay on the
+wheel-less image and InstantTensor will not load.
+
+1. Update the kit:
+
+```bash
+git pull
+```
+
+2. Set these lines in `.env` (already the default in `.env.example`; do
+   the same in `.env.tp3` / `.env.tp4` if you use those):
+
+```
+IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
+LOAD_FORMAT=instanttensor
+```
+
+3. Pull that tag on the head and restart. `SKIP_BUILD=1` keeps the published
+   GHCR image (do not let a recipe-stamp mismatch rebuild from this
+   Dockerfile). `./start.sh` then pulls on the worker when GHCR is reachable,
+   otherwise it ships the digest over SSH:
+
+```bash
+SKIP_BUILD=1 ./start.sh restart
+```
+
+If `.env` has `SKIP_PULL=1`, override it for this restart:
+
+```bash
+SKIP_PULL=0 SKIP_BUILD=1 ./start.sh restart
+```
+
+Manual pull, then the same restart:
+
+```bash
+docker pull ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
+```
+
+Keep the wheel-less tag only if you also clear the loader:
+`IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3` and `LOAD_FORMAT=`.
 
 ## Quick start (2× Spark)
 
@@ -729,7 +796,7 @@ SPEC_METHOD=mtp ./start.sh restart      # MTP k=2
 `./start.sh` will:
 
 1. Preflight docker/ssh/disk on both nodes
-2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies. A failed pull is fatal *after* both containers have already been stopped, so the serve stays down until you rerun: if you point `IMAGE` at a private package, either `docker login ghcr.io` on the head or keep `SKIP_PULL=1` in `.env`. A matching recipe stamp is what sends a restart down the pull path at all — a restart that follows an `overlay/` or Dockerfile edit rebuilds locally instead and never notices.
+2. `docker pull` `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` (public; no login) on the head, then the same pull on the worker if GHCR is reachable — **unless** the local image's `glm53.recipe.stamp` does not match this checkout (Dockerfile/overlay change after `git pull`), in which case it rebuilds from this Dockerfile once. If the worker cannot pull, `docker save --platform linux/arm64 | ssh docker load`. `SKIP_PULL=1` keeps a local copy. `SKIP_BUILD=1` keeps GHCR even when the stamp drifts. `SKIP_SHIP=1` never copies. A failed pull is fatal *after* both containers have already been stopped, so the serve stays down until you rerun: if you point `IMAGE` at a private package, either `docker login ghcr.io` on the head or keep `SKIP_PULL=1` in `.env`. A matching recipe stamp is what sends a restart down the pull path at all — a restart that follows an `overlay/` or Dockerfile edit rebuilds locally instead and never notices. Existing kits: see [Existing installs: pull the InstantTensor image](#existing-installs-pull-the-instanttensor-image) — `git pull` alone does not replace `:exl3`.
 3. Download the TR3 EXL3 repo into `$HF_HOME` / `~/.cache/huggingface` (~164 GiB, 120 shards) if missing. Same job as `./download.sh`, which stops here (head only).
 4. Put the cache on the worker: **`NFS_SHARE=1`** (this kit) mounts the head's
    HF cache read-only over NFSv4 on ConnectX; otherwise `rsync` a full copy to
@@ -1040,8 +1107,8 @@ that are now documented/enforced:
 | `MODEL_FALLBACK` | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` | Used if the mirror 404s or has fewer than 120 shards |
 | `SERVED_MODEL_NAME` | `GLM-5.3-Flash-EXL3` | Primary OpenAI `model` id (`/v1/models`) |
 | `SERVED_MODEL_ALIASES` | *(empty)* | Extra `--served-model-name` ids (space-separated, quote in `.env`). Example: `"GLM-5.3-Flash claude-GLM-5.3-Flash"` |
-| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3`. This fork serves from `ghcr.io/palmfuture/glm53-exl3-stable:dev`, which is private — a pull needs `docker login ghcr.io` or `SKIP_PULL=1` |
-| `LOAD_FORMAT` | *(empty on this kit)* | `--load-format`. Direct-I/O safetensors. Required empty on the wheel-less `:exl3` tag; a locally built tag carries the wheel whatever it is named, so set it explicitly there. **Left off at 1M here**: 12x faster weight load, but ~4-5 GiB less host headroom per node and both nodes into swap — see *InstantTensor at 1M* |
+| `IMAGE` | `ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor` | public GHCR tag with InstantTensor 0.2.0. Existing kits must pull this tag — `git pull` does not replace a leftover `:exl3` ([Existing installs](#existing-installs-pull-the-instanttensor-image)). Rebuilt when the overlay recipe stamp drifts (`BUILD=1` forces; `SKIP_BUILD=1` keeps GHCR). `SKIP_PULL=1` skips pull. Wheel-less fallback: `:exl3`. This fork serves from `ghcr.io/palmfuture/glm53-exl3-stable:dev`, which is private — a pull needs `docker login ghcr.io` or `SKIP_PULL=1` |
+| `LOAD_FORMAT` | *(empty on this kit)* | `--load-format`. Direct-I/O safetensors. Explicit empty (`LOAD_FORMAT=`) restores vLLM auto. Required empty on the wheel-less `:exl3` tag; a locally built tag carries the wheel whatever it is named, so set it explicitly there. **Left off at 1M here**: 12x faster weight load, but ~4-5 GiB less host headroom per node and both nodes into swap — see *InstantTensor at 1M* |
 | `GHCR_TOKEN` / `GHCR_USER` | *(unset)* | optional login if anonymous GHCR pull is rate-limited |
 | `PORT` | `8888` | OpenAI API on the head |
 | `VLLM_API_KEY` | *(unset)* | opt-in Bearer token for `/v1`. Empty = open API. `/health` stays keyless |
@@ -1078,7 +1145,7 @@ that are now documented/enforced:
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` when unset | TP=2 `start.sh` passes the effective value to both ranks. An explicit empty value disables this option; caller exports, including empty, override `.env`. Changing allocator settings requires a restart and separate memory/connector qualification; TP=4 is unchanged |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
-| `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | TP=2 DFlash2 drafter retention. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. TP=4 rejects a non-empty value. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
+| `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | DFlash2 drafter retention on TP=2/3/4. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
 | `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_MIXED_PREFILL_CHUNK` | `fair` (`start.sh`, `start-tp3.sh`, `start-tp4.sh`, `.env.example`, `.env.tp3.example`, `.env.tp4.example`) | Mixed-prefill policy while a peer decodes. **`skip` starves prefills until decode ends**. `N>0` caps mixed chunks; `0`/`off` mixes prefill into decode steps and leaves the uniform decode graph (~10 tok/s). `fair` (v6 on `work/stable-e3`) still allocates decodes first and gives a never-served newcomer a probe, but a **decode step does not carry a prefill chunk**: `hold_decode` on a funded `prefill_turn`, credit clamped, two empty isolated turns force `decode_only` (GPU must not idle), and prefill is capped at 800 ms/s so 1s decode windows stay above 12 tok/s. Leftover: mixed 2+2 average decode ~31–35 tok/s and newcomer 16k TTFT ~34–39 s. See [receipts](docs/diditfix.md) and [design](docs/astra-fix.md). |
@@ -1209,7 +1276,7 @@ docker build -t glm53-flash-sm121:local .
 # or: BUILD=1 ./start.sh
 ```
 
-`./start.sh` **rebuilds** from this Dockerfile when the image label `glm53.recipe.stamp` does not match the current overlay/Dockerfile hash — that is what makes a `git pull` pick up `exl3_fat_gemm` instead of staying on the public GHCR tag (which predates E2). `SKIP_BUILD=1` keeps GHCR. `BUILD=1` forces a rebuild. `SKIP_PULL=1` skips `docker pull` only.
+`./start.sh` **rebuilds** from this Dockerfile when the image label `glm53.recipe.stamp` does not match the current overlay/Dockerfile hash — that is what makes a `git pull` pick up `exl3_fat_gemm` instead of staying on the public GHCR tag (which predates E2). `SKIP_BUILD=1` keeps GHCR. `BUILD=1` forces a rebuild. `SKIP_PULL=1` skips `docker pull` only. To take the InstantTensor default without a local rebuild, set `IMAGE` to `:exl3-instanttensor` and restart with `SKIP_BUILD=1` ([Existing installs](#existing-installs-pull-the-instanttensor-image)).
 
 After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap layer so they do not rebuild `exllamav3_ext`.
 
