@@ -55,6 +55,8 @@ def summarize(path: Path) -> dict:
             [float(x) for x in tokens if x is not None]
         ),
         "concurrency": rec.get("concurrency", 1),
+        "contaminated_runs": rec.get("contaminated_runs"),
+        "max_running_observed": rec.get("max_running_observed"),
         "note": "decode_ms_per_draft_step is a serving-cycle ratio, not a kernel timing",
     }
 

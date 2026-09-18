@@ -12,6 +12,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,7 @@ NAN_RE = re.compile(r"\bnan\b|locklock", re.I)
 SPEC_RE = re.compile(
     r"^(vllm:spec_decode_[a-zA-Z0-9_]+)\{([^}]*)\}\s+(\S+)$"
 )
+GAUGE_RE = re.compile(r"^(vllm:num_requests_(?:running|waiting))\{[^}]*\}\s+(\S+)$")
 
 
 def _auth_headers() -> dict[str, str]:
@@ -99,6 +101,52 @@ def spec_snapshot() -> dict[str, float]:
         else:
             out[name] = out.get(name, 0.0) + val
     return out
+
+
+def gauges() -> dict[str, float]:
+    """Live request counters. The spec-decode metrics this bench diffs are
+    engine-wide, so any request that is not ours lands inside the delta and
+    silently changes the reported acceptance."""
+    req = urllib.request.Request(BASE + "/metrics", headers=_auth_headers())
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    out: dict[str, float] = {}
+    for line in raw.splitlines():
+        m = GAUGE_RE.match(line)
+        if m:
+            out[m.group(1)] = out.get(m.group(1), 0.0) + float(m.group(2))
+    return out
+
+
+class LoadWatch:
+    """Polls the running/waiting gauges while a measured request is in flight."""
+
+    def __init__(self, interval: float = 0.5):
+        self.interval = interval
+        self.max_running = 0.0
+        self.max_waiting = 0.0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                g = gauges()
+                self.max_running = max(self.max_running, g.get("vllm:num_requests_running", 0.0))
+                self.max_waiting = max(self.max_waiting, g.get("vllm:num_requests_waiting", 0.0))
+            except Exception:  # noqa: BLE001 - a failed sample must not fail the bench
+                pass
+            self._stop.wait(self.interval)
+
+    def __enter__(self) -> "LoadWatch":
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
 
 def spec_delta(before: dict[str, float], after: dict[str, float]) -> dict:
@@ -313,21 +361,25 @@ def main() -> int:
         )
         before = spec_snapshot()
         if args.concurrency == 1:
-            r = stream_bench(args.max_tokens, prompt=prompt)
+            with LoadWatch() as watch:
+                r = stream_bench(args.max_tokens, prompt=prompt)
             r["spec"] = spec_delta(before, spec_snapshot())
+            r["max_running"] = watch.max_running
+            r["foreign"] = max(0.0, watch.max_running - args.concurrency)
             rec["runs"].append(r)
         else:
             import concurrent.futures
 
             wall0 = time.perf_counter()
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=args.concurrency
-            ) as pool:
-                futs = [
-                    pool.submit(stream_bench, args.max_tokens, prompt)
-                    for _ in range(args.concurrency)
-                ]
-                parts = [f.result() for f in futs]
+            with LoadWatch() as watch:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=args.concurrency
+                ) as pool:
+                    futs = [
+                        pool.submit(stream_bench, args.max_tokens, prompt)
+                        for _ in range(args.concurrency)
+                    ]
+                    parts = [f.result() for f in futs]
             wall = time.perf_counter() - wall0
             after = spec_snapshot()
             spec = spec_delta(before, after)
@@ -344,6 +396,8 @@ def main() -> int:
                 "finish_reason": [p["finish_reason"] for p in parts],
                 "nan": any(p["nan"] for p in parts),
                 "spec": spec,
+                "max_running": watch.max_running,
+                "foreign": max(0.0, watch.max_running - args.concurrency),
             }
             rec["runs"].append(r)
         print(
@@ -394,6 +448,17 @@ def main() -> int:
         ]
     )
     rec["any_nan"] = any(r["nan"] for r in rec["runs"])
+    # Engine-wide spec-decode counters: a request that is not ours inside the
+    # measurement window lands in the delta and moves the reported acceptance.
+    rec["contaminated_runs"] = sum(1 for r in rec["runs"] if (r.get("foreign") or 0) > 0)
+    rec["max_running_observed"] = max((r.get("max_running") or 0) for r in rec["runs"]) if rec["runs"] else 0
+    if rec["contaminated_runs"]:
+        print(
+            f"[bench] WARNING: {rec['contaminated_runs']}/{len(rec['runs'])} runs overlapped "
+            f"foreign requests (max running {rec['max_running_observed']:.0f} vs concurrency "
+            f"{args.concurrency}); acceptance and tok/s in those runs are not this bench alone",
+            flush=True,
+        )
     if not args.skip_coherence:
         print("[bench] coherence", flush=True)
         rec["coherence"] = coherence()
