@@ -144,6 +144,14 @@ and `overlay/exl3.py` stay stock until you select a generated overlay with
 Do not load the DS4.1 cooperative `.so` here. Serving measurements vs the
 tables above (prose ×1 **37.1** / ×2 **51.1** agg, structured ×1 62.9) are recorded
 after the GPU gate in [`docs/cooperative-moe.md`](docs/cooperative-moe.md).
+
+Measured on **this** kit at 1M (not 850k) in
+[`docs/cooperative-moe-2x-1m.md`](docs/cooperative-moe-2x-1m.md): decode
+**ms/step −9.6 to −13.5 %** across prose, structured, coding and prose ×2, with
+structured acceptance unchanged to four decimals (6.712 / 0.9588), both nodes
+passing the 48-check GPU gate including adaptive-k capture rows 3 and 5, and no
+measurable host-headroom cost. Rebuilding in a fork image moves the pinned
+`.so` digest; that note also covers the repin.
 Live operator handoff (geometry 1, rollback, pins):
 [`docs/cooperative-moe-handoff.md`](docs/cooperative-moe-handoff.md).
 The two-node opt-in and rollback sequence is
