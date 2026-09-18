@@ -4,7 +4,37 @@ All notable changes to this GLM-5.3-Flash EXL3 serve recipe are documented here.
 
 Versions **1.0.0–1.5.0** are retrospective SemVer labels over merged `main` history.
 There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a release.
-Dates are merge dates on `MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`.
+**1.6.0** is this kit's current cut. Dates are merge dates on
+`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`.
+
+## [Unreleased]
+
+## [1.6.0] — 2026-09-17
+
+TP3 ABI2 cooperative MoE and opt-in FlashKDA, ABLIT off, and new sparkDash
+prose decode tables for this 2× and 3× kit.
+
+### Added
+
+- Opt-in TP3 expert-parallel cooperative kernel (ABI2, 32/64-row) and
+  FlashKDA prefill adaptation (`HAREM_KDA_FLASHKDA`, default 0) on
+  `start-tp3.sh` only. Incomplete ABI2 bundles are refused before restart
+  teardown. (#208, merged as #212)
+- Staging of verified TP3 bundles on all ranks; optional
+  `examples/tp3-throughput.env` profile.
+
+### Changed
+
+- `start-tp3.sh` forces `ABLIT=0` after sourcing `.env` (opt in with
+  `ABLIT=1 ./start-tp3.sh` or `ABLIT=1` in `.env.tp3`). It does not inherit
+  the TP2 `EXL3_OVERLAY_HOST` or FAST/FAT flags. #207 SWA retention stays.
+- `start.sh` also forces `ABLIT=0` after `.env`; `ABLIT=1 ./start.sh` still
+  opts in.
+- README sparkDash prose decode (thinking off, this kit, 2026-09-17):
+  **TP2** ×1 37.1 / 36.1 str (TTFT 333 ms), ×2 51.1 / 25.0 (365 ms),
+  ×3 65.8 / 22.3 (405 ms), ×4 75.3 / 19.4 (401 ms).
+  **TP3** 512 tok ×1 40.1 (255 ms), ×2 56.6 / 28.7 (411 ms),
+  ×3 75.5 / 25.5 (323 ms), ×4 88.4 / 22.8 (351 ms).
 
 ## [1.5.0] — 2026-09-17
 
