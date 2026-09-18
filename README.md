@@ -244,6 +244,36 @@ cannot. Consequences worth knowing before benchmarking prose:
 
 Receipts: `logs/decode-1m-20260916/`.
 
+#### FlashKDA chunked prefill at 1M (2026-09-18)
+
+`HAREM_KDA_FLASHKDA=1`, same boot otherwise, against the cold-prefill ladder
+measured on this branch earlier the same day. `tests/_run_cold_prefill.py`
+rungs, one cold request each.
+
+| Rung | Triton | FlashKDA | Δ |
+|---|---:|---:|---:|
+| ~8k | 1277 | 1219.5 | **−4.5 %** |
+| ~12k | 1301 | 1374.0 | **+5.6 %** |
+| ~16k | 1317 | 1393.8 | **+5.8 %** |
+| ~100k | 1345 | 1398.8 | **+4.0 %** |
+| ~256k | 1305 | 1373.0 | **+5.2 %** |
+| ~300k | 1301 | **1378.5** | **+6.0 %** |
+
+Prefill tok/s. The 300k TTFT drops from about 230 s to 217.6 s. The shape
+matches a chunked kernel with a fixed per-chunk cost: 8k has too few chunks to
+pay it back, everything from 12k up settles at +4 to +6 %.
+
+Decode is unchanged, as the patch claims: prose 86.73 ms/step against ~86.9 and
+structured 98.80 against ~99.2, with `contaminated_runs` 0 on both. Host
+headroom stayed in its usual band once the 300k prefill had been reclaimed
+(head 4.44 GiB, worker 6.07 GiB); samples taken immediately after that rung read
+as low as 2.3 GiB and are reclaim lag, not a cost.
+
+Upstream ships this wired on `start-tp3.sh` only and records native GPU
+validation as pending. There is no packaged numerical gate for it, unlike the
+cooperative MoE kernel, so the evidence here is the unchanged decode path,
+coherent output and the ladder itself.
+
 #### InstantTensor at 1M: 12x faster load, 4-5 GiB less headroom (2026-09-16)
 
 `LOAD_FORMAT=instanttensor` (upstream #200) is off on this kit. Same image
@@ -1189,6 +1219,7 @@ that are now documented/enforced:
 | `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
 | `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal). Covers greedy, k-only, p-only, k+p **and plain sampling** (neither prefilter), the last of which reaches `_gumbel_sample_kernel` / `_rejection_kernel` / `_resample_kernel` |
+| `HAREM_KDA_FLASHKDA` | `0` | `1` selects the FlashKDA chunked-prefill backend on both ranks (`overlay/patch_flashkda_tp3.py`; the file name is provenance, not a topology limit). Decode is unchanged. Measured at 1M on this kit: prefill **+4.0 to +6.0 %** from 12k up, **−4.5 %** at 8k. Upstream wires it on `start-tp3.sh` only and marks native GPU validation pending |
 | `GLM53_WARMUP_LONG_PREFILL` | *(unset)* | extra prefill rung in tokens. A prompt over 128k compiles one more `BuildPrefillChunkMetadataKernel` specialization that otherwise JIT-compiles under the first large production request; at ~1.3k prefill tok/s a 256k rung costs about 200 s of boot, so it is opt-in |
 | `TRITON_HOST_CACHE` / `TILELANG_HOST_CACHE` | `$CACHE_ROOT/triton` / `tilelang` | persist JIT caches across container recreate |
 | `NFS_SHARE` | `0` in `.env.example`; this kit's `.env` is `1` | `1` = workers mount the head's HF cache over NFSv4 instead of an rsync copy — see [Sharing weights from the head](#sharing-weights-from-the-head-nfs_share1). TP=3 inherits `.env` unless `.env.tp3` overrides |
