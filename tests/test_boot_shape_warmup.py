@@ -7,15 +7,15 @@ GPU or a real 2-node kit; no timing threshold is asserted.
 
 Three consumer-visible outcomes:
 
-  pass          exit 0 and a "24/24 requests ok" summary, with every ladder /
+  pass          exit 0 and a "25/25 requests ok" summary, with every ladder /
                 prefill prompt arriving at the API byte-exact — n copies of
                 "hello", single spaces, no trailing space — including the
                 65536 rung (5 ladder + 4 prefill + 15 batch arms at the
                 explicitly configured GLM53_WARMUP_MAX_CONCURRENCY=4)
   mismatch      a rung whose /tokenize count disagrees is reported failed, the
-                rest of the sweep still runs, exit 1 with "23/24"
+                rest of the sweep still runs, exit 1 with "24/25"
   small-context a deployment that refuses the 65536 prefill (HTTP 400) still
-                warms the other 23 shapes and exits 1 — the launcher WARNs
+                warms the other 24 shapes and exits 1 — the launcher WARNs
 
 Run:  python3 tests/test_boot_shape_warmup.py   (or pytest)
 """
@@ -40,7 +40,7 @@ MODEL = "GLM-5.3-Flash-EXL3"
 # LADDER_S + PREFILL_S as the script ships them.
 RUNGS = (1, 24, 56, 120, 248, 3584, 7168, 14336, 65536)
 # 5 ladder + 4 prefill + 15 batch arms at the configured concurrency of 4.
-TOTAL = 24
+TOTAL = 25  # 9 rungs + 7 single-stream arms incl. samp-plain + 2 + 3 + 4
 # One prefill rung is enough to trip the check: the reported count is compared
 # against the requested s, so a single disagreement fails that rung only.
 MISMATCH_S = 7168

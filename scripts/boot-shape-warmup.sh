@@ -57,6 +57,12 @@ LADDER_S=(1 24 56 120 248)
 # can still compile one more specialization.
 # Prefills do not affect the DFlash BLOCK shapes above (decode is 1 query).
 PREFILL_S=(3584 7168 14336 65536)
+# A prompt above 128k compiles one more BuildPrefillChunkMetadataKernel
+# specialization, which otherwise JIT-compiles under the first large production
+# request. It costs minutes of boot at ~1.3k prefill tok/s, so it is opt-in.
+if [ -n "${GLM53_WARMUP_LONG_PREFILL:-}" ]; then
+  PREFILL_S+=("$GLM53_WARMUP_LONG_PREFILL")
+fi
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -81,6 +87,11 @@ fire() {
       # are how glm53-flash's sampler drops the p / k tensors (None).
       sampling-k)  sample_fields='"top_k":40,"top_p":1.0' ;;
       sampling-p)  sample_fields='"top_k":0,"top_p":0.9' ;;
+      # Neither tensor: the sampler drops both prefilters and takes the plain
+      # Gumbel path, which no k/p arm reaches. Observed JIT-compiling
+      # _gumbel_sample_kernel, _rejection_kernel and _resample_kernel during
+      # production decode on 2026-09-18.
+      sampling-plain) sample_fields='"top_k":0,"top_p":1.0' ;;
       *)           sample_fields='"top_k":40,"top_p":0.9' ;;
     esac
     payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"max_tokens":24,"temperature":0.8,'"$sample_fields"',"chat_template_kwargs":{"enable_thinking":'"$thinking_json"'}}'
@@ -222,13 +233,14 @@ total_t0=$(date +%s)
 ladder
 prefill
 
-EXPECTED_CHAT_REQUESTS=6
+EXPECTED_CHAT_REQUESTS=7
 burst c1        1 32 bounded false
 burst think-c1  1 16 bounded true
 burst short-c1  1 8 serve-default
 burst samp-k    1 8 sampling-k false
 burst samp-p    1 8 sampling-p false
 burst samp-kp   1 8 sampling-kp false
+burst samp-plain 1 8 sampling-plain false
 if [ "$MAX_CONCURRENCY" -ge 2 ]; then
   burst short-c2 2 8 serve-default
   EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 2))
