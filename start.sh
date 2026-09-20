@@ -231,6 +231,8 @@ KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
 ADAPTIVE_K_PATCH_HOST="${ADAPTIVE_K_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_adaptive_k.py}"
 DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp8.py}"
+FLASHKDA_PATCH_HOST="${FLASHKDA_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_flashkda.py}"
+FLASHKDA_IMPL_HOST="${FLASHKDA_IMPL_HOST:-$SCRIPT_DIR/overlay/patch_flashkda_tp3.py}"
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
@@ -397,6 +399,11 @@ GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
 # Empty uses the adapter default (1). Must be identical on both ranks and set
 # before native prepare / CUDA-graph capture; it is not a live graph switch.
 GLM53_COOP_GEOMETRY="${GLM53_COOP_GEOMETRY:-}"
+# FlashKDA chunked prefill. The tp3 in the implementation file name is where the
+# port came from, not a topology limit: it patches the pinned vLLM KDA layout this
+# TP2 kit also runs. Decode is unchanged. Upstream marks native GPU validation
+# pending and wires it on start-tp3.sh only, so it stays off by default here.
+HAREM_KDA_FLASHKDA="${HAREM_KDA_FLASHKDA:-0}"
 # Empty leaves the template's omitted-effort fallback unchanged.
 GLM53_DEFAULT_REASONING_EFFORT="${GLM53_DEFAULT_REASONING_EFFORT-}"
 # 1 = honour the per-request GPU prefix-cache no-store flag
@@ -670,6 +677,7 @@ validate_numeric_config() {
     if [ -n "${GLM53_COOP_GEOMETRY:-}" ]; then
         _glm53_validate_enum GLM53_COOP_GEOMETRY "$GLM53_COOP_GEOMETRY" 0 1 2 || return
     fi
+    _glm53_validate_enum HAREM_KDA_FLASHKDA "${HAREM_KDA_FLASHKDA:-0}" 0 1 || return
 }
 # GLM53 numeric config guard (end)
 
@@ -728,6 +736,8 @@ validate_overlay_artifacts() {
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
         "$ADAPTIVE_K_PATCH_HOST|[glm53-adaptive-k]|$main_guard"
         "$DENSE_FP8_PATCH_HOST|[glm53-dense-fp8]|$main_guard"
+        "$FLASHKDA_PATCH_HOST|HAREM_KDA_FLASHKDA|$main_guard"
+        "$FLASHKDA_IMPL_HOST|patch-flashkda|    main()"
         "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
         "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
@@ -1098,6 +1108,8 @@ preflight() {
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
     [ -f "$ADAPTIVE_K_PATCH_HOST" ] || die "$ADAPTIVE_K_PATCH_HOST missing"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "$DENSE_FP8_PATCH_HOST missing"
+    [ -f "$FLASHKDA_PATCH_HOST" ] || die "$FLASHKDA_PATCH_HOST missing"
+    [ -f "$FLASHKDA_IMPL_HOST" ] || die "$FLASHKDA_IMPL_HOST missing"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "$DEFAULT_TOKENS_PATCH_HOST missing"
     [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
@@ -1599,6 +1611,7 @@ GLM53_OVERLAY_ORDER=(
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
+    patch_flashkda.py
     patch_default_max_new_tokens.py
     patch_indexer_workspace.py
     patch_cache_reset.py
@@ -1853,6 +1866,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$ADAPTIVE_K_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_adaptive_k.py"
     [ -f "$DENSE_FP8_PATCH_HOST" ] || die "missing $DENSE_FP8_PATCH_HOST"
     scp -q -o BatchMode=yes "$DENSE_FP8_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_dense_fp8.py"
+    scp -q -o BatchMode=yes "$FLASHKDA_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_flashkda.py"
+    scp -q -o BatchMode=yes "$FLASHKDA_IMPL_HOST" "${WORKER_SSH}:/tmp/flashkda_impl.py"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
@@ -1965,7 +1980,7 @@ launch_cluster() {
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
              GLM53_ADAPTIVE_K_MIN_STEPS GLM53_ADAPTIVE_K_SATURATE GLM53_ADAPTIVE_K_BATCH \
              GLM53_ADAPTIVE_K_HIST GLM53_DENSE_FP8 GLM53_COOP_GEOMETRY \
-             GLM53_EXL3_MOE_FAST; do
+             GLM53_EXL3_MOE_FAST HAREM_KDA_FLASHKDA; do
         serve_env+=" -e $v='${!v:-}'"
         serve_env_names+=("$v")
     done
@@ -2049,6 +2064,8 @@ launch_cluster() {
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
         -v '/tmp/patch_adaptive_k.py:/opt/glm53/patch_adaptive_k.py:ro' \
         -v '/tmp/patch_dense_fp8.py:/opt/glm53/patch_dense_fp8.py:ro' \
+        -v '/tmp/patch_flashkda.py:/opt/glm53/patch_flashkda.py:ro' \
+        -v '/tmp/flashkda_impl.py:/opt/glm53/flashkda_impl.py:ro' \
         -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
@@ -2090,6 +2107,8 @@ launch_cluster() {
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \
         -v "$ADAPTIVE_K_PATCH_HOST:/opt/glm53/patch_adaptive_k.py:ro" \
         -v "$DENSE_FP8_PATCH_HOST:/opt/glm53/patch_dense_fp8.py:ro" \
+        -v "$FLASHKDA_PATCH_HOST:/opt/glm53/patch_flashkda.py:ro" \
+        -v "$FLASHKDA_IMPL_HOST:/opt/glm53/flashkda_impl.py:ro" \
         -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
@@ -2152,6 +2171,7 @@ launch_cluster() {
         -e GLM53_DENSE_FP8="$GLM53_DENSE_FP8" \
         -e GLM53_EXL3_MOE_FAST="$GLM53_EXL3_MOE_FAST" \
         -e GLM53_COOP_GEOMETRY="$GLM53_COOP_GEOMETRY" \
+        -e HAREM_KDA_FLASHKDA="$HAREM_KDA_FLASHKDA" \
         -e MODEL_DIR="$MODEL_DIR" \
         -e VLLM_API_KEY \
         -e EXTRA_ARGS="${EXTRA_ARGS:-}" \
