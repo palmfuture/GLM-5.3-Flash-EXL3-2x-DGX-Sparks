@@ -92,7 +92,7 @@ class BundleTests(unittest.TestCase):
     def test_rank_wiring(self):
         source=(ROOT/'start-tp3.sh').read_text()
         self.assertEqual(source.count('python3 /opt/glm53/patch_flashkda_tp3.py --root'),2)
-        self.assertIn('GLM53_COOP_GEOMETRY HAREM_KDA_FLASHKDA; do',source)
+        self.assertIn('GLM53_KDA_BF16_LARGE_M GLM53_COOP_GEOMETRY HAREM_KDA_FLASHKDA; do',source)
         self.assertIn('-e "HAREM_KDA_FLASHKDA=$HAREM_KDA_FLASHKDA"',source)
         self.assertIn('"$FLASHKDA_PATCH_HOST" "${ssh_t}:/tmp/patch_flashkda_tp3.py"',source)
         self.assertIn('verify-artifacts "$src"',source)
@@ -105,6 +105,10 @@ class BundleTests(unittest.TestCase):
         self.assertIn('unset EXL3_OVERLAY_HOST', source)
         self.assertIn('unset GLM53_EXL3_MOE_FAST', source)
         self.assertIn('unset GLM53_KDA_FP8_FAT', source)
+        self.assertNotIn('unset GLM53_KDA_BF16_LARGE_M', source)
+        self.assertIn('GLM53_KDA_BF16_LARGE_M="${GLM53_KDA_BF16_LARGE_M-0}"', source)
+        self.assertIn('GLM53_KDA_BF16_LARGE_M GLM53_COOP_GEOMETRY HAREM_KDA_FLASHKDA', source)
+        self.assertIn('-e GLM53_KDA_BF16_LARGE_M="$GLM53_KDA_BF16_LARGE_M"', source)
         self.assertNotIn('GLM53_EXL3_MOE_FAST="${GLM53_EXL3_MOE_FAST-0}"', source)
         self.assertNotIn('-e GLM53_KDA_FP8_FAT=', source)
         self.assertIn('HAREM_KDA_FLASHKDA="${HAREM_KDA_FLASHKDA:-0}"', source)
@@ -114,8 +118,15 @@ class BundleTests(unittest.TestCase):
         self.assertNotIn('GLM53_KDA_FP8_FAT', example)
         start = (ROOT / 'start.sh').read_text()
         self.assertIn('\nABLIT=0\n', start)
-        self.assertNotIn('HAREM_KDA_FLASHKDA', start)
-        self.assertNotIn('patch_flashkda_tp3.py', start)
+        # Fork divergence from upstream: this kit also wires FlashKDA on the TP2
+        # launcher. Upstream asserts start.sh carries neither the flag nor the
+        # implementation file; here both are present but default off, and the
+        # ordered overlay entry is the no-argument wrapper, never the upstream
+        # file (which needs --root/--in-place and cannot be an ordered entry).
+        self.assertIn('HAREM_KDA_FLASHKDA="${HAREM_KDA_FLASHKDA:-0}"', start)
+        self.assertIn('FLASHKDA_IMPL_HOST="${FLASHKDA_IMPL_HOST:-$SCRIPT_DIR/overlay/patch_flashkda_tp3.py}"', start)
+        self.assertIn('\n    patch_flashkda.py\n', start)
+        self.assertNotIn('\n    patch_flashkda_tp3.py\n', start)
 
     def test_profile_covers_adaptive_rows(self):
         text=(ROOT/'examples/tp3-throughput.env').read_text()
