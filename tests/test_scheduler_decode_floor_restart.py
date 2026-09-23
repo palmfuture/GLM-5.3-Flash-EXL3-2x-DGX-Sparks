@@ -88,7 +88,7 @@ def _nest(fragment: str) -> str:
 
 
 def build_clean_scheduler() -> str:
-    """Minimal compilable scheduler containing every v5 anchor exactly once."""
+    """Minimal compilable scheduler containing every v7 anchor exactly once."""
     parts = [
         "# Synthetic scheduler fixture: real anchors, stub bodies.\n",
         df.IMPORT_OLD,
@@ -97,13 +97,15 @@ def build_clean_scheduler() -> str:
         "class Scheduler:\n",
         "    def schedule(self):\n",
     ]
-    parts.extend(_nest(old) for _new, old, _label in df.V5_PAIRS)
+    # v7 adds one anchor outside the v5 set (the Mamba split tail stop).
+    anchors = df.V5_PAIRS + ((df.TAIL_STOP_NEW, df.TAIL_STOP_OLD, "tail_stop"),)
+    parts.extend(_nest(old) for _new, old, _label in anchors)
     parts.append("        return None\n\n\n")
     parts.append(CUDA_GRAPH_NEEDLE)
     parts.append("from vllm.config import VllmConfig\n")
     text = "".join(parts)
     compile(text, "<fixture>", "exec")
-    for _new, old, label in df.V5_PAIRS:
+    for _new, old, label in anchors:
         assert text.count(old) == 1, f"fixture anchor {label} not unique"
     assert text.count(CUDA_GRAPH_NEEDLE) == 1
     return text

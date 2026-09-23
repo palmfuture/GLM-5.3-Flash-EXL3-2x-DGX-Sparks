@@ -839,6 +839,25 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v7]
               f"missed={self.missed_prefill} timing=host_busy_proxy", flush=True)
 
     @staticmethod
+    def tail_stop(sched, position):
+        """Keep the Eagle last-cache-position stop only where a hit can land.
+
+        The Mamba split stops a prefill at the last cacheable position (one
+        scheduler block before the prompt end under Eagle) so its state gets
+        materialized. Here the scheduler block is 64 tokens but prefix hits
+        are aligned to 3584 (fine-grained hits are disabled by KpoolTail), so
+        a stop at e.g. prompt-64 caches a state no lookup can return, and
+        costs one extra 64-127 token prefill step (~0.4 s fixed cost) on 89%
+        of requests in the 2026-09-22 head log. Stop only at hit-aligned
+        positions; the prompt's last chunk may end unaligned anyway.
+        """
+        try:
+            align = int(sched.kv_cache_manager.coordinator._cache_hit_alignment_tokens)
+        except Exception:
+            return position
+        return position if align <= 0 or position % align == 0 else 0
+
+    @staticmethod
     def aligned_new_tokens(
         start, num_new, prefill_end, block_size, max_prefill_tokens, policy_cap=None
     ) -> int:
@@ -1251,9 +1270,17 @@ def unpatch_v6(text: str) -> str:
     return text
 
 
-# v7: same scheduler anchors as v6 with the marker advanced; only the helper
-# (cost fit and progress floor) changed.
-V7_PAIRS = tuple((new.replace(MARK_V6, MARK_V7), old, label) for new, old, label in V6_PAIRS)
+# v7: v6 anchors with the marker advanced, plus the hit-aligned tail stop in
+# the Mamba split (the helper also changed: cost fit and progress floor).
+TAIL_STOP_OLD = """            # Never run past the last cacheable block boundary mid-chunk.
+            last_cache_position,
+"""
+TAIL_STOP_NEW = """            # Never run past the last cacheable block boundary mid-chunk.
+            _GLM53_MIXED.tail_stop(self, last_cache_position),  # [glm53-decode-floor:v7]
+"""
+V7_PAIRS = tuple((new.replace(MARK_V6, MARK_V7), old, label) for new, old, label in V6_PAIRS) + (
+    (TAIL_STOP_NEW, TAIL_STOP_OLD, "tail_stop"),
+)
 
 
 def unpatch_v7(text: str) -> str:

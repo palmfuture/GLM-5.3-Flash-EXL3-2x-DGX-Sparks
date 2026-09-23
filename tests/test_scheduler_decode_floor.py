@@ -33,6 +33,7 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 POLICY = mod._Glm53MixedPrefill
+POLICY_MOD_MIXED = POLICY
 PATCHED_SOURCE = None
 FAIR_ENV = {
     'GLM53_MIXED_PREFILL_CHUNK': 'fair',
@@ -630,6 +631,58 @@ class FairTests(unittest.TestCase):
         self.assertEqual(ns['input_budget'], 0)
 
 
+class TailStopTests(unittest.TestCase):
+    """Head-log shape: scheduler block 64, Eagle, hits aligned to 3584, budget 7104."""
+
+    def split_fn(self):
+        if PATCHED_SOURCE is None:
+            self.skipTest('needs the installed scheduler source')
+        tree = ast.parse(PATCHED_SOURCE)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == '_mamba_block_aligned_split')
+        ns = {'Request': object, '_GLM53_MIXED': POLICY_MOD_MIXED}
+        exec(compile(ast.Module([fn], []), 'split', 'exec'), ns)
+        return ns['_mamba_block_aligned_split']
+
+    def sched(self, align=3584):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=64), use_eagle=True, hash_block_size=64,
+            mamba_partial_cache_hit=False, max_num_scheduled_tokens=7104,
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+            _glm53_align_prefill_limit=None,
+            kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(_cache_hit_alignment_tokens=align)))
+
+    def chunks(self, split, s, ctx, fresh):
+        r = SimpleNamespace(num_prompt_tokens=ctx + fresh, num_tokens=ctx + fresh,
+                            num_computed_tokens=ctx, shared_prefix_boundary=0)
+        out = []
+        while r.num_computed_tokens < r.num_prompt_tokens:
+            n = split(s, r, min(r.num_prompt_tokens - r.num_computed_tokens, s.max_num_scheduled_tokens))
+            self.assertGreater(n, 0)
+            out.append(n)
+            r.num_computed_tokens += n
+        return out
+
+    def test_unaligned_last_cache_position_no_longer_adds_a_tail_step(self):
+        split, s, ctx = self.split_fn(), self.sched(), 21 * 3584
+        # v6 split these as 2432+92, 448+88, 64+87 (one extra ~0.4 s step each).
+        self.assertEqual(self.chunks(split, s, ctx, 2524), [2524])
+        self.assertEqual(self.chunks(split, s, ctx, 536), [536])
+        self.assertEqual(self.chunks(split, s, ctx, 151), [151])
+        self.assertEqual(self.chunks(split, s, ctx, 32793)[-1], 32793 - 4 * 7104)
+
+    def test_hit_aligned_last_cache_position_still_stops(self):
+        # prompt = ctx + 3584 + 64: last_cache_position = ctx + 3584 is hit-aligned.
+        split, s, ctx = self.split_fn(), self.sched(), 21 * 3584
+        self.assertEqual(self.chunks(split, s, ctx, 3584 + 64), [3584, 64])
+
+    def test_without_alignment_info_keeps_stock_stop(self):
+        split, ctx = self.split_fn(), 21 * 3584
+        s = self.sched()
+        s.kv_cache_manager = SimpleNamespace(coordinator=SimpleNamespace())
+        self.assertEqual(self.chunks(split, s, ctx, 2524), [2432, 92])
+
+
 def installation_tests():
     src = next((p for p in [Path(os.environ.get('GLM53_SCHEDULER_PY_SRC', '/missing')),
                            Path('/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py'),
@@ -692,7 +745,11 @@ def main():
     ns = {'os': os, 'time': __import__('time')}
     exec(PATCHED_SOURCE[begin:end], ns)
     POLICY = ns['_Glm53MixedPrefill']
-    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(FairTests))
+    global POLICY_MOD_MIXED
+    POLICY_MOD_MIXED = POLICY
+    suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(FairTests),
+                                unittest.defaultTestLoader.loadTestsFromTestCase(TailStopTests)])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
 
