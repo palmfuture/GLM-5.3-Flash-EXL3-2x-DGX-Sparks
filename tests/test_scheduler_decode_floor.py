@@ -265,7 +265,100 @@ class FairTests(unittest.TestCase):
         p = self.policy(GLM53_FAIR_PREFILL_MAX_INTERVAL_MS='10000', GLM53_FAIR_PREFILL_MAX_STEP_MS='100')
         self.assertEqual(p.interval_s, 10)
         self.assertEqual(p.max_step_s, 0.1)
-        self.assertEqual(p.cap_for(self.s, self.b), 0)
+        # Nothing fits 100 ms, but a never-served newcomer still gets the
+        # smallest rung through the borrow gate (v6 returned 0 forever).
+        self.assertEqual(p.cap_for(self.s, self.b), 256)
+        self.assertTrue(p._open_rec['grants']['B'][2])
+
+    def head_log_stuck_samples(self):
+        # 2026-09-22 head log: least squares fitted fixed=0.875 s, above the
+        # 750 ms step budget, from heavy-tailed host timings. Typical steps
+        # are ~0.3 s fixed + ~0.65 ms/token.
+        self.p.solo_samples = ([(3584, 2.4)] * 6 + [(7168, 4.9)] * 6 + [(117, 1.63), (128, 3.98),
+                               (256, 4.06), (7168, 9.89), (3584, 6.39), (384, 0.92)]
+                               + [(128, 0.39)] * 6)
+        self.p.mixed_samples = [((1, 3, 0), 256, 0.53)] * 18 + [((1, 3, 0), 256, 4.1), ((1, 3, 0), 512, 10.4)]
+        self.p._model_cache = None
+
+    def test_heavy_tail_samples_do_not_lift_fixed_cost_over_budget(self):
+        self.p = self.policy(GLM53_FAIR_PREFILL_MAX_STEP_MS='750', GLM53_FAIR_PREFILL_SHARE='0.30',
+                             GLM53_FAIR_PREFILL_MAX_INTERVAL_MS='750')
+        self.head_log_stuck_samples()
+        fixed, per_tok = self.p._cost_model()
+        self.assertLess(fixed, 0.5)
+        self.assertLess(self.p._est_dt(256), 0.75)
+        self.p.begin_step(self.s)
+        self.p.last_service['B'] = self.clock()
+        self.p.credit = 0.75
+        self.assertGreaterEqual(self.p.cap_for(self.s, self.b), 256)
+
+    def test_floor_keeps_contended_prefill_moving_when_nothing_fits(self):
+        # Every rung estimated above the step budget: v6 deferred B with
+        # gap_budget until A finished. v7 serves the smallest rung once B is
+        # due and debt is repaid, then waits for repayment again.
+        self.p = self.policy(GLM53_FAIR_PREFILL_MAX_STEP_MS='750', GLM53_FAIR_PREFILL_MAX_INTERVAL_MS='750')
+        self.p.solo_samples = [(128, 1.1), (256, 1.2), (3584, 4.0)]
+        self.p.mixed_samples = [((1, 3, 0), 128, 1.1), ((1, 3, 0), 256, 1.2)]
+        self.p._model_cache = None
+        self.assertIsNone(self.p._target(None, 0.75))
+        self.p.begin_step(self.s)
+        self.p.last_service['B'] = self.clock()
+        self.p.credit = 0.75
+        self.assertEqual(self.p.cap_for(self.s, self.b), 0)  # not due yet
+        self.assertEqual(self.p.defer_reason, 'gap_budget')
+        self.clock.advance(1.0)
+        self.s.current_step += 1
+        self.p.begin_step(self.s)
+        self.assertTrue(self.p._prefill_can_grant())
+        self.assertTrue(self.p.hold_decode(self.a))
+        self.assertEqual(self.p.cap_for(self.s, self.b), 128)
+        out = self.submit({'B': 128})
+        self.complete(out, 1.1)
+        self.assertLess(self.p.credit, 0)
+        # In debt: the next due turn defers, then decode-only turns repay.
+        self.clock.advance(1.0)
+        self.assertEqual(self.p.cap_for(self.s, self.b), 0)
+        served = 0
+        for _ in range(60):
+            self.s.current_step += 1
+            self.p.begin_step(self.s)
+            cap = self.p.cap_for(self.s, self.b)
+            out = self.submit({'B': cap} if cap else {'A': 8})
+            self.complete(out, 1.1 if cap else 0.1)
+            served += bool(cap)
+        self.assertGreaterEqual(served, 2)
+        self.assertLessEqual(served, 30)  # still rate-limited, not every step
+
+    def test_c4_three_decoders_and_newcomers_all_progress(self):
+        # C4 at the head-log costs with launcher knobs: three incumbents decode
+        # while two prompts wait. Each waiting prompt must keep getting chunks.
+        self.p = self.policy(GLM53_FAIR_PREFILL_MAX_STEP_MS='750', GLM53_FAIR_PREFILL_SHARE='0.30',
+                             GLM53_FAIR_PREFILL_MAX_INTERVAL_MS='750')
+        self.head_log_stuck_samples()
+        decs = [Req(f'D{i}', 30000, 30000, decode=True) for i in range(3)]
+        news = [Req('N0', 20000), Req('N1', 20000)]
+        s = Sched(decs, news)
+        served = {'N0': 0, 'N1': 0}
+        for _ in range(400):
+            self.p.begin_step(s)
+            counts = {}
+            for r in news:
+                cap = self.p.cap_for(s, r)
+                if cap:
+                    counts[r.request_id] = cap
+            if not counts:
+                counts = {d.request_id: 8 for d in decs}
+            out = Out(counts)
+            self.p.finish_step(s, out)
+            s.current_step += 1
+            self.clock.advance(0.53 if any(k in served for k in counts) else 0.13)
+            self.p.observe_output(s, out)
+            for rid, n in counts.items():
+                if rid in served:
+                    served[rid] += n
+                    s.requests[rid].num_computed_tokens += n
+        self.assertGreater(served['N0'], 2000)
+        self.assertGreater(served['N1'], 2000)
 
     def test_cost_feedback_can_shrink_chunks(self):
         self.learn(cost=1.5)
@@ -544,13 +637,13 @@ def installation_tests():
     if src is None:
         raise SystemExit('Set GLM53_SCHEDULER_PY_SRC to the pinned scheduler source')
     clean = src.read_text()
-    for marker, fn in [(mod.MARK_V6, mod.unpatch_v6), (mod.MARK_V5, mod.unpatch_v5), (mod.MARK_V4, mod.unpatch_v4), (mod.MARK_V3, mod.unpatch_v3), (mod.MARK_V2, mod.unpatch_v2)]:
+    for marker, fn in [(mod.MARK_V7, mod.unpatch_v7), (mod.MARK_V6, mod.unpatch_v6), (mod.MARK_V5, mod.unpatch_v5), (mod.MARK_V4, mod.unpatch_v4), (mod.MARK_V3, mod.unpatch_v3), (mod.MARK_V2, mod.unpatch_v2)]:
         if marker in clean:
             clean = fn(clean)
     if mod.V1_HELPER_START in clean:
         clean = mod.unpatch_v1(clean)
     with tempfile.TemporaryDirectory() as temp:
-        for version in (0, 1, 2, 3, 4, 5):
+        for version in (0, 1, 2, 3, 4, 5, 6):
             text = clean
             if version:
                 marker = mod.MARK if version == 1 else getattr(mod, f'MARK_V{version}')
@@ -558,7 +651,10 @@ def installation_tests():
                           f'\nclass _Glm53MixedPrefill:  {marker}\n    pass\n\n')
                 needle = 'from vllm.compilation.cuda_graph import CUDAGraphStat\n'
                 text = text.replace(needle, helper + needle, 1)
-                if version == 5:
+                if version == 6:
+                    for new, old, label in mod.V6_PAIRS:
+                        text = mod.replace_once(text, old, new, label)
+                elif version == 5:
                     for new, old, label in mod.V5_PAIRS:
                         text = mod.replace_once(text, old, new, label)
                 elif version == 4:
@@ -577,7 +673,7 @@ def installation_tests():
             subprocess.run([sys.executable, str(PATCH)], env=env, check=True, capture_output=True)
             installed = target.read_text()
             compile(installed, str(target), 'exec')
-            assert mod.MARK_V6 in installed and mod.MARK_V5 not in installed and mod.MARK_V4 not in installed and mod.MARK_V3 not in installed and mod.MARK_V2 not in installed
+            assert mod.MARK_V7 in installed and mod.MARK_V6 not in installed and mod.MARK_V5 not in installed and mod.MARK_V4 not in installed and mod.MARK_V3 not in installed and mod.MARK_V2 not in installed
             subprocess.run([sys.executable, str(PATCH)], env=env, check=True, capture_output=True)
             assert target.read_text() == installed
             # Marker alone must not suppress validation or overwrite source drift.

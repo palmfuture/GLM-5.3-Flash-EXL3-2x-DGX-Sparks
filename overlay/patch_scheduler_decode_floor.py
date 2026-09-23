@@ -44,10 +44,15 @@ Fair knobs (read at runtime; identical on every rank):
   GLM53_FAIR_PREFILL_MAX_STEP_MS      default 2000 (estimated mixed-step limit)
   GLM53_FAIR_PREFILL_MAX_CHUNKS       default 1
 
-Versioned installer: `# [glm53-decode-floor:v6]`. v1 (no version), v2, v3,
-v4 and v5 images are unpatched then re-patched. Fail closed if anchors drift.
+Versioned installer: `# [glm53-decode-floor:v7]`. v1 (no version), v2..v6
+images are unpatched then re-patched. Fail closed if anchors drift.
 v6: a step that already has decode work does not also take a prefill chunk
 (prefill_turn holds decode tokens so the uniform decode graph stays intact).
+v7: robust (Theil-Sen) step-cost fit plus a progress floor. v6 least squares
+let heavy-tailed host timings lift the fitted fixed cost above
+GLM53_FAIR_PREFILL_MAX_STEP_MS; no rung fit, and every contended prefill
+starved (`defer=gap_budget`) until the decoder finished. Scheduler anchors
+are v6 with the marker advanced.
 """
 from __future__ import annotations
 
@@ -69,6 +74,7 @@ MARK_V3 = "# [glm53-decode-floor:v3]"
 MARK_V4 = "# [glm53-decode-floor:v4]"
 MARK_V5 = "# [glm53-decode-floor:v5]"
 MARK_V6 = "# [glm53-decode-floor:v6]"
+MARK_V7 = "# [glm53-decode-floor:v7]"
 
 IMPORT_OLD = """import itertools
 import time
@@ -255,7 +261,7 @@ V3_WAITING_MAMBA_NEW = """                        num_new_tokens = self._mamba_b
                             break
 """
 
-class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
+class _Glm53MixedPrefill:  # [glm53-decode-floor:v7]
     """Bound contention using completion feedback, without synchronizing GPUs."""
 
     LADDER = (128, 256, 512, 768, 1024, 1536, 2048)
@@ -346,7 +352,7 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
             self.max_step_s = 2.0
         if self.mode == "fair" and not self.logged_boot:
             print(
-                f"[glm53-decode-floor] fair v5 probe_chunk={self.chunk} "
+                f"[glm53-decode-floor] fair v7 probe_chunk={self.chunk} "
                 f"ladder={min(self.LADDER)}..{max(self.LADDER)} share={self.share} "
                 f"interval_s={self.interval_s} max_step_s={self.max_step_s} "
                 f"max_chunks={self.max_chunks}",
@@ -420,6 +426,13 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
         Needs two distinct chunk sizes; otherwise returns None and the caller
         scales linearly. v4 scaled one sample linearly, priced 1024 tokens off
         128-token samples at ~3x the real cost, and never climbed back.
+
+        v7 fits with Theil-Sen (median pairwise slope, median residual
+        intercept) instead of least squares. Host timings here are heavy
+        tailed (a 128-token step at p50 0.39 s but max 4 s; 7168 up to 10 s),
+        and v6 least squares let a few such steps push the intercept to
+        ~0.9 s, above the 750 ms step budget, so no rung ever fit and every
+        contended prefill starved until the decoder finished.
         """
         if self._model_cache is not None:
             return self._model_cache
@@ -427,14 +440,11 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
         pts = mixed + [(n, dt) for n, dt in self.solo_samples[-self.FIT_WINDOW:]]
         if len(pts) < 2 or len({n for n, _ in pts}) < 2:
             return None
-        cnt = float(len(pts))
-        sx = float(sum(n for n, _ in pts))
-        sy = float(sum(dt for _, dt in pts))
-        sxx = float(sum(n * n for n, _ in pts))
-        sxy = float(sum(n * dt for n, dt in pts))
-        den = cnt * sxx - sx * sx
-        b = max(0.0, (cnt * sxy - sx * sy) / den) if den > 0 else 0.0
-        a = max(0.0, (sy - b * sx) / cnt)
+        slopes = sorted((dt2 - dt1) / (n2 - n1)
+                        for i, (n1, dt1) in enumerate(pts)
+                        for n2, dt2 in pts[i + 1:] if n2 != n1)
+        b = max(0.0, self._median(slopes))
+        a = max(0.0, self._median(sorted(dt - b * n for n, dt in pts)))
         if mixed:
             ratios = sorted(dt / max(1e-6, a + b * n) for n, dt in mixed)
             r = ratios[min(len(ratios) - 1, int(0.75 * len(ratios)))]
@@ -443,6 +453,12 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
         r = min(1.5, max(1.0, r))
         self._model_cache = (a * r, b * r)
         return self._model_cache
+
+    @staticmethod
+    def _median(values):
+        n = len(values)
+        mid = n // 2
+        return values[mid] if n % 2 else 0.5 * (values[mid - 1] + values[mid])
 
     def _est_dt(self, tokens, shape=None):
         """Conservative host-time estimate; not a guaranteed execution bound."""
@@ -457,17 +473,31 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
             return max(0.01, max(dt * max(0.5, n / t) for _, t, dt in samples))
         return max(0.05, n / self.COLD_TOK_S)
 
-    def _target(self, remaining, room):
-        """Largest rung whose estimated step fits `room` (tokens per accounted
-        second rise with size under a fixed per-step cost), or None."""
+    def _rungs(self, remaining):
         rungs = {self.chunk}
         if self.mixed_samples or self._cost_model() is not None:
             rungs.update(self.LADDER)
         if remaining is not None:
             rungs = {min(n, remaining) for n in rungs}
-        fitting = [(n, self._est_dt(n)) for n in sorted(rungs)]
+        return sorted(rungs)
+
+    def _target(self, remaining, room):
+        """Largest rung whose estimated step fits `room` (tokens per accounted
+        second rise with size under a fixed per-step cost), or None."""
+        fitting = [(n, self._est_dt(n)) for n in self._rungs(remaining)]
         fitting = [(n, cost) for n, cost in fitting if cost <= room + 1e-9]
         return fitting[-1] if fitting else None
+
+    def _floor_pick(self, remaining):
+        """Smallest rung, used when not even it fits the whole step budget.
+
+        Without this floor an estimate above max_step_s defers every contended
+        prefill until the decoder finishes (v6 starvation). It only ever goes
+        through the borrow gate: due by age, all shared debt repaid, alone in
+        the turn, so overrun steps stay rate-limited by debt repayment.
+        """
+        n = self._rungs(remaining)[0]
+        return n, self._est_dt(n)
 
     def _credit_limit(self):
         return min(self.max_step_s, self._est_dt(max(self.chunk, max(self.LADDER))))
@@ -623,10 +653,9 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
                 continue
             remaining = self.prefill_remaining(request)
             pick = self._target(remaining, self.max_step_s)
-            if pick is None:
-                continue
-            cap, cost = pick
-            if cost <= self.credit + 1e-9:
+            overrun = pick is None
+            cap, cost = pick or self._floor_pick(remaining)
+            if not overrun and cost <= self.credit + 1e-9:
                 return True
             age = now - self.last_service.get(rid, self.arrival[rid])
             due = rid not in self.last_service or age >= self.interval_s
@@ -660,6 +689,10 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
         gap_room = max(0.0, self.max_step_s - reserved)
         age = self._now() - self.last_service.get(rid, self.arrival[rid])
         pick = self._target(remaining, gap_room)
+        overrun = False
+        if pick is None and not rec["grants"]:
+            pick = self._floor_pick(remaining)
+            overrun = True
         if pick is None:
             self._release(rid, "gap_budget")
             if age >= self.interval_s:
@@ -671,7 +704,7 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
         # at 128-token steps once one expensive sample priced 256 too high).
         cap, cost = pick
         borrowed = False
-        if cost > self.credit + 1e-9:
+        if overrun or cost > self.credit + 1e-9:
             # A never-served newcomer gets a prompt probe; afterwards service
             # ages. Either may borrow ONE step-bounded chunk globally, only
             # after all shared debt is repaid: queue churn or several aged
@@ -681,7 +714,7 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v6]
                     and not rec["borrowed"]):
                 borrowed = True
             else:
-                self._release(rid, "credit")
+                self._release(rid, "gap_budget" if overrun else "credit")
                 if age >= self.interval_s:
                     self.missed_prefill += 1
                     self._maybe_log()
@@ -826,8 +859,8 @@ def _helper_text() -> str:
     return (
         "\n"
         + body
-        + "\n_GLM53_MIXED = _Glm53MixedPrefill()  # [glm53-decode-floor:v6]\n\n"
-        + "def _glm53_mixed_prefill_policy(sched, request, computed=None):  # [glm53-decode-floor:v6]\n"
+        + "\n_GLM53_MIXED = _Glm53MixedPrefill()  # [glm53-decode-floor:v7]\n\n"
+        + "def _glm53_mixed_prefill_policy(sched, request, computed=None):  # [glm53-decode-floor:v7]\n"
         + "    return _GLM53_MIXED.cap_for(sched, request, computed)\n\n\n"
     )
 
@@ -1188,8 +1221,8 @@ def unpatch_v5(text: str) -> str:
     for new, old, label in V5_PAIRS:
         text = replace_once(text, new, old, label)
     # No expected= here, unlike upstream: they verify a live v5 install, this branch
-    # only migrates one to v6. _helper_text() emits v6 markers, so a helper that
-    # could match it would already have been caught by the MARK_V6 branch above.
+    # only migrates one to v7. _helper_text() emits v7 markers, so a helper that
+    # could match it would already have been caught by the MARK_V7 branch above.
     text = _strip_helper(text, "v5")
     if MARK_V5 in text:
         raise SystemExit(f"{P}: v5 leftover after unpatch")
@@ -1210,18 +1243,34 @@ def apply_v5(text: str) -> str:
 def unpatch_v6(text: str) -> str:
     for new, old, label in V6_PAIRS:
         text = replace_once(text, new, old, label)
-    text = _strip_helper(text, "v6", expected=_helper_text())
+    # No expected=: this branch only migrates a v6 install to v7, and
+    # _helper_text() now emits the v7 helper.
+    text = _strip_helper(text, "v6")
     if MARK_V6 in text:
         raise SystemExit(f"{P}: v6 leftover after unpatch")
     return text
 
 
-def apply_v6(text: str) -> str:
+# v7: same scheduler anchors as v6 with the marker advanced; only the helper
+# (cost fit and progress floor) changed.
+V7_PAIRS = tuple((new.replace(MARK_V6, MARK_V7), old, label) for new, old, label in V6_PAIRS)
+
+
+def unpatch_v7(text: str) -> str:
+    for new, old, label in V7_PAIRS:
+        text = replace_once(text, new, old, label)
+    text = _strip_helper(text, "v7", expected=_helper_text())
+    if MARK_V7 in text:
+        raise SystemExit(f"{P}: v7 leftover after unpatch")
+    return text
+
+
+def apply_v7(text: str) -> str:
     if "import os\n" not in text.split("import time\n", 1)[0]:
         text = replace_once(text, IMPORT_OLD, IMPORT_NEW, "import os")
     needle = "from vllm.compilation.cuda_graph import CUDAGraphStat\n"
     text = replace_once(text, needle, _helper_text() + needle, "helper")
-    for new, old, label in V6_PAIRS:
+    for new, old, label in V7_PAIRS:
         text = replace_once(text, old, new, label)
     compile(text, str(P), "exec")
     return text
@@ -1232,23 +1281,25 @@ def main() -> int:
         raise SystemExit(f"missing {P}")
     text = P.read_text()
     original = text
-    if MARK_V6 in text:
+    if MARK_V7 in text:
         # Validate existing anchors/helper instead of trusting the marker alone.
-        # unpatch_v6 checks every v6 insertion occurs exactly once, requires the
+        # unpatch_v7 checks every v7 insertion occurs exactly once, requires the
         # helper region verbatim, and rejects leftover markers. Its result is
         # discarded: patch_adaptive_k.py legitimately inserts its own helper
         # between this one and the cuda_graph import anchor, so re-applying at
         # that fixed anchor would relocate the helper and fail a byte-compare on
         # a healthy file (upstream #198, the same bug on v5).
-        unpatch_v6(text)
+        unpatch_v7(text)
         # The import edit is part of the applied state; the byte-compare used
         # to cover it implicitly.
         if "import os\n" not in text.split("import time\n", 1)[0]:
-            raise SystemExit(f"{P}: v6 import drifted")
+            raise SystemExit(f"{P}: v7 import drifted")
         compile(text, str(P), "exec")
-        print(f"{P.name}: {MARK_V6} already present — verified")
+        print(f"{P.name}: {MARK_V7} already present — verified")
         return 0
-    if MARK_V5 in text:
+    if MARK_V6 in text:
+        text = unpatch_v6(text)
+    elif MARK_V5 in text:
         text = unpatch_v5(text)
     elif MARK_V4 in text:
         text = unpatch_v4(text)
@@ -1258,12 +1309,12 @@ def main() -> int:
         text = unpatch_v2(text)
     elif MARK in text or V1_HELPER_START in text:
         text = unpatch_v1(text)
-    text = apply_v6(text)
-    if MARK_V2 in text or MARK_V3 in text or MARK_V4 in text or MARK_V5 in text:
+    text = apply_v7(text)
+    if any(m in text for m in (MARK_V2, MARK_V3, MARK_V4, MARK_V5, MARK_V6)):
         raise SystemExit(f"{P}: older marker left after migration")
     if text != original:
         P.write_text(text)
-    print(f"patched {P.name} ({MARK_V6})")
+    print(f"patched {P.name} ({MARK_V7})")
     return 0
 
 
