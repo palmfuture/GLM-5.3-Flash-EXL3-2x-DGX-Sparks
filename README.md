@@ -24,6 +24,11 @@ FlashKDA and combined-profile measurements](docs/tp3-throughput-results.md).
 Historical measurements and pending validation of the upstream-based branch
 are documented separately; existing defaults are unchanged.
 
+Reference TP=2 profile for long coding sessions (262k context, two active
+requests, selected default-off options with their tradeoffs):
+[`examples/tp2-long-coding.env`](examples/tp2-long-coding.env). Append it to a
+configured `.env`; defaults are unchanged.
+
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
 The Hub card on brandonmusic (TP2/EP2/DCP2 + calibrated NVFP4 MLA KV) is the SM120 B12X
 image (`verdictai/glm53-flash-exl3-k4:…-v84-dflash2`), not this overlay. Target KV
@@ -181,7 +186,7 @@ query lengths (`k + 1`, bounded by `DFLASH_TOKENS + 1`), including the full draf
 length, through `MAX_NUM_SEQS`. Explicit `--cudagraph-capture-sizes` in `EXTRA_ARGS`
 always wins; eager mode and non-DFlash capture defaults are unchanged.
 
-then `./start.sh restart`. The capture-size list is required for adaptive-k (multiples of 3, 5 and 8 up to 4 requests; the stock `1 2 4 8 16 24 32` misses the 3- and 5-token shapes). The KV cap turns FP8's freed GPU memory into host headroom instead of a bigger pool: uncapped, the head dropped to ~1.5 GiB MemAvailable at 850k. 14 GiB leaves an 883,552-token pool (1.04x of 850k) and ~5 GiB free; 15 GiB buys 1.11x but measured only 0.8-2.2 GiB free under load, which is not enough margin on this UMA. Do not go much lower at 850k either — the boot refuses a pool that cannot hold one max-length request (13 GiB is ~820k tokens). Verify after boot: `docker logs glm53-exl3-head | grep -a "adaptive-k\|dense fp8"` should show `uniform decode graph query lens: [3, 5, 8]` and `dense fp8 groups: dense,kda`, and with `ABLIT=1` the line `ABLIT_METHOD=auto -> transplant` (a missing `ablit/transplant/` silently falls back to the projection edit, which garbles sampled output). A running server can be retuned without a reboot through `~/.cache/vllm-glm53-flash/glm53_adaptive_k.json` (`{"mode":"ema","set":"2,4,7","margin":1.0}`; `{"mode":"off"}` restores k=7). Live sparkDash prose numbers with both on are in the table above.
+then `./start.sh restart`. The capture-size list is required for adaptive-k (multiples of 3, 5 and 8 up to 4 requests; the stock `1 2 4 8 16 24 32` misses the 3- and 5-token shapes). The KV cap turns FP8's freed GPU memory into host headroom instead of a bigger pool: uncapped, the head dropped to ~1.5 GiB MemAvailable at 850k. 14 GiB leaves an 876,958-token pool (1.03x of 850k) and ~5 GiB free; 15 GiB buys 1.11x but measured only 0.8-2.2 GiB free under load, which is not enough margin on this UMA. Do not go much lower at 850k either — the boot refuses a pool that cannot hold one max-length request (13 GiB is ~820k tokens). Verify after boot: `docker logs glm53-exl3-head | grep -a "adaptive-k\|dense fp8"` should show `uniform decode graph query lens: [3, 5, 8]` and `dense fp8 groups: dense,kda`, and with `ABLIT=1` the line `ABLIT_METHOD=auto -> transplant` (a missing `ablit/transplant/` silently falls back to the projection edit, which garbles sampled output). A running server can be retuned without a reboot through `~/.cache/vllm-glm53-flash/glm53_adaptive_k.json` (`{"mode":"ema","set":"2,4,7","margin":1.0}`; `{"mode":"off"}` restores k=7). Live sparkDash prose numbers with both on are in the table above.
 
 Lab `tests/bench_decode.py` on the same protocol (median of 5 × 400, 2026-08-30 C4, `DFLASH_DRAFT_TP=2`): Structured **65.1** tok/s (0.959 accept / 6.71 per step); Prose (hash-map) **27.1** (0.341 / 2.39). Prior TP=1 lab: 61.7 / 26.9. Long context / mixed (~60–100k KV) 24–27. MTP k=2 baseline ~24.6.
 
@@ -640,6 +645,252 @@ toward 7168 if you need document-grade detail from single images, and watch
 **NVFP4 KV is not available here.** FlashInfer’s SM12x NVFP4 kernels are dense MHA,
 not sparse MLA. Do not confuse that with NVFP4 **weights** (`--moe-backend marlin`).
 
+### Experimental compact DFlash2 cache pages
+
+`GLM53_DRAFT_KV_COMPACT=1` reduces the block IDs reserved by the drafter's
+padded slot-shared cache. Default `0` keeps 64-token padded blocks. The
+TP2/TP3/TP4 launchers accept exactly `0` or `1` and reject `1` unless
+`SPEC_METHOD=dflash`; this is a startup setting. It changes neither weight
+nor KV precision, the sliding window, nor the target cache groups. The
+PR233 KDA path is independent and unchanged.
+
+The block size is derived from the actual cache geometry: the largest
+multiple of 64 that divides the MLA block and fits inside its physical
+page. Divisibility preserves prefix-cache alignment. For example, a
+3,584-token MLA block at 656 bytes/token and a 2,048-byte/token draft
+selects 896 tokens, not a fixed size borrowed from another deployment.
+With a 2,048-token window and 2,048 in-flight tokens, the pinned allocator's
+draft admission bound drops from **65 to 6 block IDs per request**.
+This is a **CPU allocator result, not a serving benchmark**: at a fixed
+cache budget, it reduces ID demand rather than backing tensor allocations.
+Automatic memory profiling can select different pool sizes between boots.
+
+Padded pages must not be split into smaller kernel blocks. Backend setup
+rejects that combination; use a backend supporting the full derived block
+(the pinned `FLASH_ATTN` backend declares multiples of 16), or disable the
+option. Unpadded exact-fit pages retain their existing behavior.
+
+**Prefix reuse with larger draft blocks.** Without the compact option, the
+drafter uses the EAGLE lookup rule: a hit needs a complete cached draft block *after*
+the reconciled 3,584-token boundary, which is then dropped. Lookup excludes
+the final prompt token, so a 64-token block needs at least 65 prompt tokens
+past the boundary; an 896-token block needs 897. A shorter same-prompt tail
+(the live 100,701-token prompt has 349) therefore lost one MLA page
+to the replay clamp (96,768 instead of 100,352 cached tokens). DFlash
+context KV at a position is a per-position projection of the target
+hidden state at that position (`precompute_and_store_context_kv`: row-wise
+RMSNorm, fused KV GEMM, K-norm, RoPE), so unlike EAGLE, whose draft KV at
+position p embeds token p+1, no block past the boundary is needed. Under
+`GLM53_DRAFT_KV_COMPACT=1` `overlay/patch_hybrid_prefix_hit.py` therefore
+looks the DFlash drafter group up ending exactly at the boundary
+(`# [glm53-dflash-boundary-lookup-v1]`). Its manager is non-EAGLE, removing
+the extra lookahead block from each retained window and its cache hashes.
+The complete-window check and replay clamp remain intact. Under the flag
+the allocator preflights every grouping path at `get_kv_cache_groups`,
+before any exact-fit or padded page is chosen: every sliding-window layer
+must belong to the DFlash drafter (speculative method and one layer per
+draft decoder layer), else boot fails. Default `0` never gates and keeps
+the EAGLE lookup and its 64-token rule.
+
+**Mamba correctness, with either flag value.** Two overlays fix the target
+state independently of compact draft pages. `patch_mamba_align_state_free.py`
+tracks every superseded state until committed progress makes release safe,
+instead of overwriting an unreleased state index during async prefill.
+Align-mode admission reserves the running state, speculative states, and
+one superseded state per concurrent batch. `patch_mamba_align_chunking.py`
+uses the Mamba group's actual block for checkpoint alignment, not the
+drafter's smaller block, and applies EAGLE back-off only when the full-attention
+group needs it. Sub-block token caps still make progress. The launchers apply
+the chunking overlay after decode-floor v5.
+
+**Installer compatibility.** The public InstantTensor image carries a legacy
+`glm53-hybrid-apc` coordinator without the current v3 verification form.
+The prefix overlay now migrates that exact form, with or without the published
+replay stage, before adding boundary lookup. It validates every owned stage
+and ordinary helper binding before writing; unsupported drift, partial or
+duplicate stages, and competing helper bindings fail with the file untouched.
+Supported stock-derived output is byte-identical to a pristine installation.
+This is source-shape validation, not a sandbox for arbitrary Python.
+
+**Follow-up qualification (2026-09-21, source-pinned receipt below).** The
+Mamba fixes were present in both OFF and ON arms; these comparisons isolate
+the additional compact-page tradeoff, not the total effect of all fixes.
+The unchanged custom configuration completed fresh OFF / ON / OFF boots
+with 81 requests each. Decode cells had nine trials per arm.
+
+| Custom measurement | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Reservation IDs per maximum-length request | 180 | 121 | 180 | −32.78% |
+| Structured decode (tokens/s) | 78.589 | 78.380 | 76.390 | +1.15% |
+| Code decode (tokens/s) | 53.493 | 52.048 | 49.361 | +1.21% |
+| Prose decode (tokens/s) | 33.188 | 31.131 | 31.200 | −3.30% |
+| C2 code aggregate (tokens/s) | 73.521 | 75.957 | 74.230 | +2.82% |
+| Cold 8k TTFT (s) | 7.042 | 7.107 | 7.125 | +0.34% |
+| Cold 32k TTFT (s) | 27.731 | 28.642 | 28.258 | +2.31% |
+| Cold 100,701-token TTFT (s) | 85.576 | 87.085 | 86.902 | +0.98% |
+| 100,701-token repeat TTFT (s) | 0.710 | 0.706 | 0.726 | −1.70% |
+| Two cold 242,628-token requests, pair wall time (s) | 419.578 | 433.644 | 420.289 | +3.26% |
+| Their follow-ups, pair wall time (s) | 5.486 | 5.718 | 6.357 | −3.43% |
+| 28,672-token prefix with a 64-token tail, repeat TTFT (s) | 2.623 | 0.302 | 3.434 | −90.02% |
+
+Positive throughput changes are faster; positive time changes are slower.
+The last row retained 28,672 tokens under ON versus 25,088 under both OFF
+arms. All six tested tails (64, 65, 349, 896, 897, 2,048) retained the full
+28,672-token prefix under ON. Automatic profiling selected 504 / 513 / 463
+usable pool IDs; reservation savings are **not a measured VRAM reduction**.
+OFF baselines drifted, including −7.73% for code and −5.99% for prose.
+
+The two approximately 3.3% regressions were followed by a **fixed,
+prespecified holdout**, not retries until a pass: three fresh OFF / ON / OFF
+boots, 45 prose trials and three independent cold long-C2 pairs per arm.
+All trials were retained:
+
+| Holdout median | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Prose decode (tokens/s) | 32.684 | 32.286 | 32.495 | −0.93% |
+| Cold long-C2 pair wall time (s) | 420.493 | 429.522 | 428.543 | +1.18% |
+
+Prose speculative acceptance varied; median time per draft changed by
+−0.30%. Greedy outputs differed even within each arm. The original
+nine-trial prose and single-pair long-C2 results above remain evidence,
+not discarded outliers. **There is no universal decode speedup.**
+
+The public image with **stock settings plus compact ON** completed all
+95 requests, including the 814,571-token cold prompt (633.711 s TTFT) and
+its repeat (2.748 s, 813,568 prefix-hit tokens), with zero preemptions.
+Context remained 850k, concurrency four, batching 7,168, utilization 0.85:
+no fixed-memory override. Stock OFF still failed startup: **13.56 GiB
+required versus 10.77 GiB available**, so a matched OFF inference comparison
+is unavailable. Cached-conversation residency is not guaranteed: the two
+243k follow-ups had TTFTs of 9.31 s and 170.08 s, with 240,128 aggregate
+prefix-hit tokens out of 485,306 queried.
+
+Across the completed full workloads and holdout: **500 requests, 140 correct
+reference answers, four successful 3,200-token rollover checks**, zero
+preemptions and no safety stops. The unchanged guards required at least
+2 GiB sampled available RAM and at most 256 MiB new swapout per node.
+Minimum sampled available RAM was 4.64 GiB in custom runs and 5.55 GiB in
+stock ON. Earlier failed runs remain preserved; the historical receipts
+below are byte-unchanged.
+
+Verification: **53 focused CPU tests passed without skips**; both immutable
+image source sets passed the Mamba/capacity tests, ordered composition,
+compilation and byte-identical reapplication. Installer/test CLI smoke
+passed inside both images with GPU and network access disabled. All 75
+native BF16 draft-cache write/attention probe cases were exact against
+64-token pages. TP3/TP4 launcher checks passed, but TP3/TP4 GPU execution,
+other architectures/backends, a full image rebuild and full-model bitwise
+equivalence remain unqualified. Cached model revisions were reused.
+**Default remains `0`.**
+
+Neutralized follow-up receipt SHA-256 (raw evidence retained privately):
+`abee1ec2b2783620a5f42cd397d29c92ce33add653f8dc106ea0103420e4b671`.
+
+**Historical custom qualification (`9a3aca4`, 2026-09-21).** That runtime
+source was tested with fresh OFF / ON / OFF boots and the existing custom TP2/DFlash2
+configuration otherwise unchanged. All **153 requests** completed; all
+**90 marker/reference answers** and three 3,200-token rollover sequence
+checks passed. The 51 prompt hashes matched across arms. No preemptions or
+safety stops occurred; minimum sampled available RAM was 4.73 GiB.
+
+| Measurement | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Reservation IDs per configured maximum-length request | 176 | 117 | 176 | −33.52% |
+| Usable pool IDs after automatic profiling | 507 | 519 | 514 | — |
+| Cached tokens on the 100,701-token repeat | 100,352 | 100,352 | 100,352 | Equal |
+| Repeat time to first token (s) | 1.043 | 0.728 | 1.052 | −30.46% |
+| Cold 100,701-token time to first token (s) | 89.109 | 87.489 | 84.729 | +0.66% |
+| Two long follow-ups, pair wall time (s) | 8.427 | 5.551 | 6.735 | −26.78% |
+| Structured decode (tokens/s) | 74.53 | 79.31 | 78.33 | +3.77% |
+| Code decode (tokens/s) | 51.23 | 50.45 | 49.64 | +0.03% |
+| Prose decode (tokens/s) | 38.81 | 30.72 | 32.19 | −13.46% |
+| C2 code aggregate (tokens/s) | 74.68 | 72.60 | 81.54 | −7.05% |
+
+Decode/concurrency values are medians of three trials. The enabled arm
+retained all 28,672 prefix tokens at tails 64, 65, 349, 896, 897 and 2,048;
+both OFF arms lost one page at tail 64. Changed-suffix references, the
+subsequent original-prompt reference, and two near-243k requests plus their
+follow-ups passed. Cold long prefills were effectively serialized.
+Freeform outputs differed, and OFF baselines drifted substantially for prose,
+C2 and long follow-ups. These are descriptive measurements, not
+identical-output kernel timings or statistical significance claims.
+The repeat-TTFT benefit reproduced; **there is no universal decode speedup**.
+Reservation-ID reduction is **not a measured reduction in VRAM**.
+
+**Historical stock qualification (`9a3aca4`): incomplete.** That source was tested on the
+public InstantTensor image with the stock 850k context, four sequences,
+7,168-token batching and GPU utilization 0.85. Cached public model revisions
+were reused; this was not a fresh model download.
+
+* **Automatic budget, OFF:** installation succeeded, but startup rejected
+  capacity: 13.46 GiB required versus 10.73 GiB available. No inference ran.
+* **Automatic budget, ON:** booted with 10.93 GiB; 64/65 requests completed,
+  31/31 marker references and the rollover check passed. The 814,571-token
+  cold prompt answered correctly (TTFT 634.510 s), with at least 5.15 GiB
+  sampled available RAM, but its completed group already recorded two
+  preemptions. The asynchronous guard caught them after cold completion,
+  as the repeat was admitted; the repeat was not completed.
+* **Adjusted stock, fixed 14 GiB:** a separate approved OFF / ON / OFF
+  comparison added only `--kv-cache-memory-bytes 15032385536`. OFF 1
+  completed 64/65 requests, then its near-limit repeat preempted. ON
+  completed 63/65, then the near-limit cold prompt crossed the 2 GiB
+  memory floor (1.668 GiB sampled). OFF 2 completed 48/65, then failed the
+  sequence check by repeating 202, before the sliding-window boundary.
+  These failed arms were preserved, not replaced by retries-to-pass.
+
+| Adjusted-stock measurement | OFF 1 | ON | OFF 2 | ON vs mean OFF |
+|---|---:|---:|---:|---:|
+| Reservation IDs per 850k request | 532 | 295 | 532 | −44.55% |
+| 100k repeat TTFT (s) | 1.114 | 0.817 | 1.090 | −25.80% |
+| Cold 100k TTFT (s) | 66.544 | 70.319 | 69.253 | +3.56% |
+| C4 code aggregate (tokens/s) | 92.35 | 95.73 | 91.18 | +4.32% |
+
+The stock comparison has 48 matching completed prompt hashes, including the
+failed OFF rollover check; it is not a full workload pass. The 14 GiB override
+is **not a safe blanket recommendation**. At that revision, the cause of
+the near-limit preemption had not yet been isolated. Smaller reservation
+bounds do not alone justify increasing context, concurrency or batching.
+
+At `9a3aca4`, 61 focused CPU tests passed without skips, plus the standalone
+hybrid smoke. SIX independently cleared the scoped source/CPU review.
+At that revision, TP3/TP4 GPU behavior, other backends/architectures,
+tensor-level numerical parity and clean near-limit stock reuse were
+unqualified. **Default stays `0`.** Neutralized historical result receipt SHA-256:
+`de9dc16deb0aafbbe60bc469d71cd250a988287c52e2f069f62537f6f4e79b46`.
+The earlier `6d5dd89` custom experiment remains separate and byte-frozen:
+`35fd5ef14b9e9502116311c5706e0ae874056369f90e38ba2184f2be3257e7e2`.
+
+CPU verification, using pristine
+[vLLM `487ecf187`](https://github.com/vllm-project/vllm/tree/487ecf187d3dfe74d2cf6119a92881dba403c219)
+sources (the five required files and hashes are listed in the test):
+
+```bash
+GLM53_VLLM_SRC=/path/to/vllm-source python3 -m pytest -q tests/test_draft_kv_compact.py
+```
+
+No torch import or model is needed. Without the source path, the two
+geometry/configuration tests run and the pinned-source tests skip. The
+pinned-source tests drive the real allocator entry point, scheduler
+config, coordinator (with the overlay applied), and single-type managers
+over a dict block pool: the live 100,701-token reuse (64-token hit,
+896-token clamp, 896-token boundary hit), every one of the 3,584 tail
+lengths across one page under dense and boundary-only retention, lookahead
+equivalence, changed suffixes and shared prefixes, evicted window blocks,
+the off-by-default gate, and the DFlash-only preflight on padded, exact-fit,
+and non-GLM grouping paths.
+
+The Mamba regressions are `tests/test_mamba_align_state_free.py` and
+`tests/test_mamba_align_chunking.py`. Point
+`GLM53_SINGLE_TYPE_KV_CACHE_MANAGER_PY`, `GLM53_KV_CACHE_INTERFACE_PY` and
+`GLM53_SCHEDULER_PY` at matching source files from a supported image, then
+run both with pytest. They exercise bounded async state ownership, safe
+release and request-ID reuse, checkpoint state positions, sub-block
+progress, installer idempotence and refusal of unsupported source.
+
+The direction was motivated by
+[Alexbob0's draft-page sizing work](https://github.com/Alexbob0/glm53-flash-vllm-upstream-sm121/blob/9bf39c3e84194a57c630a42c0d79066159a5b787/overlay/patch_kv_drafter_group.py#L64-L83);
+the geometry-derived selection and backend guard here are specific to this recipe.
+
 ## Prefix caching (this kit, 2026-08-30)
 
 `--enable-prefix-caching` is on. The OpenAI API is **stateless**: the client
@@ -765,6 +1016,40 @@ a separate configuration; the all-zero results do not qualify it. See the
 [protocol, raw measurements, and limitations](docs/apc-retention-qualification.md)
 before selecting a policy or a cache budget for another kit.
 
+## InstantTensor and KV memory
+
+`LOAD_FORMAT=instanttensor` (the default on `:exl3-instanttensor`) loads the 164 GiB
+checkpoint in ~65–70 s cold and under 10 s when the files are still in page cache, versus
+~290–300 s for vLLM auto. The cost is KV pool: on a 2x GB10 kit at 850k / fp8 / rightsize it
+leaves **~12.4–12.5 GiB** available versus **~17–18 GiB** with the loader off (measured across
+three boots each; #204). One 850k request needs 13.56 GiB, so the stock `GPU_MEM_UTIL=0.85`
+does not boot with the loader on — the engine fails at KV allocation after the weights are
+already loaded. `Model loading took 79.65 GiB` is identical either way; the difference shows
+up only in `Available KV cache memory`.
+
+Three ways to run it, in the order we recommend (the first is the shipped default as of this change):
+
+| setting | KV pool | boots on 2x GB10 | notes |
+|---|---|---|---|
+| `EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"` (14 GiB), share 0.85 | 883,552 tok, 1.04x | 3/3 | explicit reservation, bypasses profiling; idle host headroom same as loader-off (~5 GiB) |
+| `LOAD_FORMAT=` **and** `EXTRA_ARGS=` (clear the shipped cap), share 0.85 | ~1.07–1.14M tok | 3/3 | ~4x slower cold load; biggest pool. Keep any other `EXTRA_ARGS` you had. |
+| `GPU_MEM_UTIL=0.88`, no explicit pool | 1,017,763 tok when it boots | 1/4 | 0.88 × 121.69 = 107.09 GiB, right at the worker's CUDA-free at check time (105.8–107.1); `preflight_memory` reads `MemAvailable` and passes anyway; ~2.4 GB less host headroom when it does boot |
+
+`start.sh` prints a `NOTE` at preflight when it sees the failing combination (loader on,
+`MAX_MODEL_LEN` ≥ 850k, `GPU_MEM_UTIL` ≤ 0.85, no `--kv-cache-memory-bytes`). It is advisory
+only: it changes no value, does not fix an undersized KV pool, and does not prevent the boot
+failure — the operator still has to change the config (add the reservation, or set
+`LOAD_FORMAT=` to have vLLM auto profile the pool), and vLLM still makes the real decision.
+The check is locale-independent: the caller's `LC_NUMERIC` cannot silence it.
+
+TP=3 / TP=4 need the opposite treatment: `start-tp3.sh` / `start-tp4.sh` drop a
+`--kv-cache-memory-bytes` that comes from the shared `.env` (keeping any other flags, and
+reporting the drop), so an existing install whose reservation lives in the shared `.env` loses
+it. Pin a topology-sized value in `.env.tp3` / `.env.tp4` instead — a topology pin is not
+stripped — or pass `EXTRA_ARGS` on the command line; a caller value, including an explicit
+empty, wins over both files. Details in
+[Existing installs](#existing-installs-pull-the-instanttensor-image).
+
 ## Existing installs: pull the InstantTensor image
 
 `main` now defaults to
@@ -779,13 +1064,38 @@ wheel-less image and InstantTensor will not load.
 git pull
 ```
 
-2. Set these lines in `.env` (already the default in `.env.example`; do
+2. Set these two lines in `.env` (already the default in `.env.example`; do
    the same in `.env.tp3` / `.env.tp4` if you use those):
 
 ```
 IMAGE=ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3-instanttensor
 LOAD_FORMAT=instanttensor
 ```
+
+   **TP=2 only**, also make sure `.env`'s `EXTRA_ARGS` contains the reservation (it is the
+   default in `.env.example`; an existing `.env` predates it). If you already have
+   `EXTRA_ARGS`, append to it rather than replacing it:
+
+```
+EXTRA_ARGS="--kv-cache-memory-bytes 15032385536"                          # no other flags yet
+EXTRA_ARGS="--your-existing-flags --kv-cache-memory-bytes 15032385536"   # keep what you had
+```
+
+   TP=3 / TP=4 do not need it and must not rely on it, and the topology templates do not clear
+   it: `start-tp3.sh` / `start-tp4.sh` strip a `--kv-cache-memory-bytes` out of the shared
+   `.env` `EXTRA_ARGS` before the topology overlay, keeping every other flag and reporting the
+   removal — 14 GiB is sized for TP=2 at 850k and neither topology was measured with it.
+   **Existing TP=3 / TP=4 installs: if that flag is in your shared `.env`, the launcher drops
+   the reservation on the next start.** Pin a topology-sized value in `.env.tp3` / `.env.tp4`
+   instead (a topology pin is not stripped), or pass `EXTRA_ARGS` on the command line — a
+   caller value, including an explicit empty, wins over both files.
+
+   The cap is required for TP=2 at `MAX_MODEL_LEN=850000` / `GPU_MEM_UTIL=0.85`: the
+   InstantTensor loader leaves ~4.4–5.6 GiB less for the KV pool than vLLM auto, and
+   without an explicit pool size the engine refuses to boot (needs 13.56 GiB, ~12.4 GiB
+   available). Raising `GPU_MEM_UTIL` to 0.88 instead is marginal on 2x GB10 — it booted
+   1 of 4 attempts here, failing vLLM's startup free-memory check on the worker even though
+   `start.sh`'s preflight passed. Details in [InstantTensor and KV memory](#instanttensor-and-kv-memory).
 
 3. Pull that tag on the head and restart. `SKIP_BUILD=1` keeps the published
    GHCR image (do not let a recipe-stamp mismatch rebuild from this
@@ -1229,6 +1539,7 @@ that are now documented/enforced:
 | `GLM53_SUPPRESS_STOPS_IN_REASONING` | `1` | ignore client `stop` strings until `</think>` (thinking-on default) |
 | `GLM53_DEFAULT_REASONING_EFFORT` | *(empty)* | `low` / `high` / `max` via `--default-chat-template-kwargs` on both ranks. Empty sends no flag, so omitted effort renders Max. Per-request `chat_template_kwargs.reasoning_effort` overrides the default; `medium` is rejected because the template maps it to Max |
 | `GLM53_INDEXER_WORKSPACE` | `rightsize` (default since 2026-09-07; was `stock`) | sparse-indexer prefill gather workspace. `stock` = `max_model_len * 40` entries (**5036.40 MB** locked at 1M — measured, `VLLM_DEBUG_WORKSPACE=1`). `rightsize` = the legal per-step maximum `min(MAX_NUM_SEQS, MNBT) * cdiv(MAX_MODEL_LEN + k, index_kpool)` = 126 MB at `MAX_NUM_SEQS=4` / 504 MB at 16, so **~+26–28% KV**. Opt-in; see [docs/DESIGN-indexer-workspace.md](docs/DESIGN-indexer-workspace.md) |
+| `GLM53_DRAFT_KV_COMPACT` | `0` | Experimental geometry-derived DFlash2 cache blocks; no additional quantization. Reduces shared block-ID demand, not allocated tensor bytes. Requires an unsplit padded page; CPU-verified only. See [compact draft pages](#experimental-compact-dflash2-cache-pages) |
 | `GLM53_SPINWAIT_MS` | `stock` | SpinCondition reader busy-loop window. `stock` preserves vLLM's 1 s default; `1..1000` selects milliseconds. A frozen TP=2 sweep selected `16` (+0.95% median decode vs stock, 85.3% less active EngineCore CPU) |
 | `GLM53_BOOT_SHAPE_WARMUP` | `1` | after `/health`, burn DFlash2 BLOCK / sampler / kpool shapes (nonfatal). Covers greedy, k-only, p-only, k+p **and plain sampling** (neither prefilter), the last of which reaches `_gumbel_sample_kernel` / `_rejection_kernel` / `_resample_kernel` |
 | `GLM53_WARMUP_LONG_PREFILL` | *(unset)* | extra prefill rung in tokens. A prompt over 128k compiles one more `BuildPrefillChunkMetadataKernel` specialization that otherwise JIT-compiles under the first large production request; at ~1.3k prefill tok/s a 256k rung costs about 200 s of boot, so it is opt-in |
@@ -1388,7 +1699,8 @@ After CUDA compile, Python overlay edits (`overlay/exl3.py`, tests) are a cheap 
 | `overlay/dflash2_speculator.py` | DFlash2 selector walk (V2 speculator) |
 | `overlay/patch_dflash2.py` | registry + `decoder_layer_cls` + speculator dispatch + draft KV `auto` on MLA/FP8 |
 | `overlay/patch_glm_eagle3.py` | Glm5Next EAGLE3 aux-hidden layers (mHC `hc_post` + contract) |
-| `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-share (`block=64`, `page_size_padded=mla_page`); runtime-mounted by `start.sh` (`DRAFTER_PATCH_HOST`) |
+| `overlay/patch_glm5_drafter_group.py` | GLM KV fast path + DFlash2 padded slot-sharing; 64-token default, optional geometry-derived block size, and worker-side split guard. Runtime-mounted through `DRAFTER_PATCH_HOST` |
+| `tests/test_draft_kv_compact.py` | CPU geometry/alignment checks and pinned-source allocator, backend rejection, idempotence, two-file preflight, and prefix-cache lookup (coordinator + managers) tests |
 | `overlay/patch_glm_video_placeholders.py` | align video timestamp blocks to encoder `grid_t` |
 | `overlay/patch_suppress_stops_in_reasoning.py` | fail-closed detokenizer guard: client `stop` dormant until `</think>` |
 | `overlay/patch_scheduler_decode_floor.py` | skip / cap / off / `fair` mixed-prefill; v5 fixed-cost step fit + largest step-fitting chunk + bounded contention credit, decode first; versioned installer |

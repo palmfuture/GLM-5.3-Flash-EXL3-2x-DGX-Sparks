@@ -88,7 +88,7 @@ def _nest(fragment: str) -> str:
 
 
 def build_clean_scheduler() -> str:
-    """Minimal compilable scheduler containing every v7 anchor exactly once."""
+    """Minimal compilable scheduler containing every v5/v7 anchor exactly once."""
     parts = [
         "# Synthetic scheduler fixture: real anchors, stub bodies.\n",
         df.IMPORT_OLD,
@@ -97,9 +97,7 @@ def build_clean_scheduler() -> str:
         "class Scheduler:\n",
         "    def schedule(self):\n",
     ]
-    # v7 adds two anchors outside the v5 set (Mamba split tail stop and block).
-    anchors = df.V5_PAIRS + ((df.TAIL_STOP_NEW, df.TAIL_STOP_OLD, "tail_stop"),
-                             (df.SPLIT_BLOCK_NEW, df.SPLIT_BLOCK_OLD, "split_block"))
+    anchors = df.V5_PAIRS
     parts.extend(_nest(old) for _new, old, _label in anchors)
     parts.append("        return None\n\n\n")
     parts.append(CUDA_GRAPH_NEEDLE)

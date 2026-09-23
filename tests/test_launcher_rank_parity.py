@@ -278,6 +278,51 @@ def part_f() -> None:
         )
 
 
+# ------------------------------------- part G (compact draft pages gate) --
+
+COMPACT = "GLM53_DRAFT_KV_COMPACT"
+
+
+def run_compact_guard(value: str, spec_method: str) -> tuple[int, str, str]:
+    script = (
+        guard_source()
+        + "\nGPU_MEM_UTIL=0.87; MAX_MODEL_LEN=1000000; MAX_NUM_SEQS=4\n"
+        + "MAX_NUM_BATCHED_TOKENS=1024\n"
+        + "GLM53_INDEXER_WORKSPACE=stock; GLM53_SPINWAIT_MS=stock\n"
+        + f"{NS}=1\n"
+        + "validate_numeric_config || exit $?\n"
+        + f'printf "%s\\n" "${COMPACT}"\n'
+    )
+    env = base_env(SPEC_METHOD=spec_method, **{COMPACT: value})
+    r = subprocess.run(["bash", "-c", script], text=True, capture_output=True, env=env)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def part_g() -> None:
+    """`GLM53_DRAFT_KV_COMPACT=1` is DFlash-only: the coordinator's boundary
+    lookup relies on DFlash's per-position context KV, so the launcher
+    rejects it before any host action unless SPEC_METHOD=dflash."""
+    print(f"Part G: {COMPACT} requires SPEC_METHOD=dflash")
+    if f'-e "{COMPACT}=' not in source():
+        print("  skip G (knob not forwarded by this checkout)")
+        return
+    for spec_method in ("dflash", "mtp", "none"):
+        rc, out, err = run_compact_guard("0", spec_method)
+        check(
+            rc == 0 and out == "0",
+            f"G1 {COMPACT}=0 accepted with SPEC_METHOD={spec_method} (rc={rc} out={out!r} {err})",
+        )
+    rc, out, err = run_compact_guard("1", "dflash")
+    check(rc == 0 and out == "1", f"G2 {COMPACT}=1 accepted with SPEC_METHOD=dflash (rc={rc} {err})")
+    for spec_method in ("mtp", "none"):
+        rc, out, err = run_compact_guard("1", spec_method)
+        check(
+            rc == 2 and COMPACT in err and "SPEC_METHOD=dflash" in err,
+            f"G3 {COMPACT}=1 rejected with SPEC_METHOD={spec_method} before launch "
+            f"(rc={rc} err={err[:80]!r})",
+        )
+
+
 # --------------------------------------------------------------- harness --
 
 
@@ -860,6 +905,7 @@ def main() -> int:
     print(f"ships: {', '.join(f'{v}={b}' for v, b in shipped_apc_vars().items())}; forwards SWA={wires_swa()} NO_STORE={wires_ns()} KVCAP={wires_kv()}")
     part_a()
     part_f()
+    part_g()
     with tempfile.TemporaryDirectory() as raw:
         h = Harness(Path(raw))
         part_b(h)
