@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Profile one agent-shaped prefill (small fresh suffix on a long cached prefix).
 
+WARNING: maintenance window only. On 2026-09-23 /start_profile on the live
+GB10 serve killed VllmWorker-0 (likely unified-memory exhaustion from the
+profiler buffers; ~6 GB free) and every request failed until a restart. Do
+not unpack the resulting trace (~84 MB gz) on the GB10 host either.
+
 Needs the serve booted with the torch profiler armed, e.g. in EXTRA_ARGS:
   --profiler-config.profiler torch
   --profiler-config.torch_profiler_dir /root/.cache/vllm/profiles
   --profiler-config.active_iterations 8
-The profiler is idle until /start_profile, so this runs against a live serve.
+The profiler is idle until /start_profile, but starting it can kill the worker.
 
 Steps: (1) warm a CTX-token prefix (not profiled), (2) /start_profile, send the
 same prefix plus FRESH new tokens, /stop_profile, (3) summarize the newest
