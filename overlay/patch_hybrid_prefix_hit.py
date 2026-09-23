@@ -259,7 +259,7 @@ CONVERGE_FINAL = """            if curr_hit_length >= hit_length:
                     if not draft_replay_ready:
                         break
                 if draft_groups_seen and draft_replay_ready:
-                    logger.info(
+                    logger.debug(  # [glm53-dflash-swa-replay-quiet]
                         "[glm53-dflash-swa-replay-v2] reusing reconciled "
                         "DFlash boundary hit=%d fresh=%d required=%d",
                         curr_hit_length,
@@ -300,6 +300,19 @@ CONVERGE_FINAL = """            if curr_hit_length >= hit_length:
 
 
 
+# The reuse line runs on every prefix lookup, and a deferred waiting request
+# is looked up again each scheduler step (one request logged 2,892 times in
+# the 2026-09-22 head log). Images that baked the INFO version get it
+# downgraded in place; the replay-clamp line stays INFO.
+QUIET_MARK = "# [glm53-dflash-swa-replay-quiet]"
+REUSE_LOG_INFO = """                    logger.info(
+                        "[glm53-dflash-swa-replay-v2] reusing reconciled "
+"""
+REUSE_LOG_DEBUG = """                    logger.debug(  # [glm53-dflash-swa-replay-quiet]
+                        "[glm53-dflash-swa-replay-v2] reusing reconciled "
+"""
+
+
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     n = text.count(old)
     if n != 1:
@@ -338,6 +351,8 @@ def main() -> int:
         text = replace_once(
             text, CONVERGE_OLD, CONVERGE_FINAL, "dflash-replay-clamp"
         )
+    if QUIET_MARK not in text:
+        text = replace_once(text, REUSE_LOG_INFO, REUSE_LOG_DEBUG, "dflash-replay-quiet")
     P.write_text(text)
     print(
         f"patched {P.name} (hybrid APC + versioned DFlash SWA replay clamp)"
