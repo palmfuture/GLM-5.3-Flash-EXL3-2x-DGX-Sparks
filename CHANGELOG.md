@@ -11,6 +11,17 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
 
 ### Added
 
+- Backport of vLLM #55736 (GLM-5.3-Flash decode hot path) as
+  `overlay/patch_glm_decode_hotpath.py`, run last on both ranks: drops the
+  duplicate router GEMM (MoERunner already holds the gate), reads KDA q/k/v/beta
+  in place through explicit token strides instead of four copies per layer,
+  writes the absorbed MLA query token-major and skips the zero-width NoPE
+  concat in the SM120 sparse backend. Bit-identical upstream; tested on CPU
+  with `tests/test_glm_decode_hotpath.py`.
+- Fair mixed-prefill scheduler v7: Theil-Sen step-cost fit, a debt-gated
+  progress floor (v6 starved contended prefills once the fitted fixed cost
+  exceeded `GLM53_FAIR_PREFILL_MAX_STEP_MS`), and a hit-aligned Eagle tail
+  stop that removes an extra 64-127 token prefill step from most requests.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
   weights for scheduled M > 512, with approximately 3.26 GiB extra retained

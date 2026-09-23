@@ -255,6 +255,7 @@ DENSE_FP8_PATCH_HOST="${DENSE_FP8_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_dense_fp
 FLASHKDA_PATCH_HOST="${FLASHKDA_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_flashkda.py}"
 FLASHKDA_IMPL_HOST="${FLASHKDA_IMPL_HOST:-$SCRIPT_DIR/overlay/patch_flashkda_tp3.py}"
 DEFAULT_TOKENS_PATCH_HOST="${DEFAULT_TOKENS_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_default_max_new_tokens.py}"
+HOTPATH_PATCH_HOST="${HOTPATH_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_glm_decode_hotpath.py}"
 EXL3_OVERLAY_HOST="${EXL3_OVERLAY_HOST:-$SCRIPT_DIR/overlay/exl3.py}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Direct-I/O safetensors on the published InstantTensor image. Unset follows
@@ -766,6 +767,7 @@ validate_overlay_artifacts() {
         "$FLASHKDA_IMPL_HOST|patch-flashkda|    main()"
         "$DEFAULT_TOKENS_PATCH_HOST|[glm53-default-max-new-tokens]|    raise SystemExit(main(sys.argv))"
         "$CACHE_RESET_PATCH_HOST|# [glm53-cache-reset]|$main_guard"
+        "$HOTPATH_PATCH_HOST|[glm53-decode-hotpath-55736]|$main_guard"
         "$SCRIPT_DIR/overlay/patch_ablit.py|$ablit_marker|    main()"
         "$SCRIPT_DIR/overlay/ablit_runtime.py|o_proj abliteration (ABLIT)|    return report"
     )
@@ -1137,6 +1139,7 @@ preflight() {
     [ -f "$FLASHKDA_PATCH_HOST" ] || die "$FLASHKDA_PATCH_HOST missing"
     [ -f "$FLASHKDA_IMPL_HOST" ] || die "$FLASHKDA_IMPL_HOST missing"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "$DEFAULT_TOKENS_PATCH_HOST missing"
+    [ -f "$HOTPATH_PATCH_HOST" ] || die "$HOTPATH_PATCH_HOST missing"
     [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
     [ -f "$SCRIPT_DIR/overlay/patch_ablit.py" ] || die "$SCRIPT_DIR/overlay/patch_ablit.py missing"
     [ -f "$SCRIPT_DIR/overlay/ablit_runtime.py" ] || die "$SCRIPT_DIR/overlay/ablit_runtime.py missing"
@@ -1621,7 +1624,8 @@ sync_weights() {
 # follows retention (sampling_params / request / block_pool only, no shared
 # anchors with the coordinator overlays). The KV-capacity log edits only
 # kv_cache_utils.py and follows patch_glm5_drafter_group.py, the other overlay
-# editing that file.
+# editing that file. The #55736 decode hot-path backport is anchored against
+# the files as every earlier overlay leaves them, so it runs last.
 GLM53_OVERLAY_ORDER=(
     patch_glm_video_placeholders.py
     patch_suppress_stops_in_reasoning.py
@@ -1642,6 +1646,7 @@ GLM53_OVERLAY_ORDER=(
     patch_indexer_workspace.py
     patch_cache_reset.py
     patch_ablit.py
+    patch_glm_decode_hotpath.py
 )
 
 # Emits the in-container apply block for GLM53_OVERLAY_ORDER (same bytes for
@@ -1896,6 +1901,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$FLASHKDA_IMPL_HOST" "${WORKER_SSH}:/tmp/flashkda_impl.py"
     [ -f "$DEFAULT_TOKENS_PATCH_HOST" ] || die "missing $DEFAULT_TOKENS_PATCH_HOST"
     scp -q -o BatchMode=yes "$DEFAULT_TOKENS_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_default_max_new_tokens.py"
+    [ -f "$HOTPATH_PATCH_HOST" ] || die "missing $HOTPATH_PATCH_HOST"
+    scp -q -o BatchMode=yes "$HOTPATH_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_glm_decode_hotpath.py"
     scp -q -o BatchMode=yes "$EXL3_OVERLAY_HOST" "${WORKER_SSH}:/tmp/glm53-exl3.py"
     _glm53_stage_coop_runtime_worker
 
@@ -2093,6 +2100,7 @@ launch_cluster() {
         -v '/tmp/patch_flashkda.py:/opt/glm53/patch_flashkda.py:ro' \
         -v '/tmp/flashkda_impl.py:/opt/glm53/flashkda_impl.py:ro' \
         -v '/tmp/patch_default_max_new_tokens.py:/opt/glm53/patch_default_max_new_tokens.py:ro' \
+        -v '/tmp/patch_glm_decode_hotpath.py:/opt/glm53/patch_glm_decode_hotpath.py:ro' \
         -v '/tmp/glm53-exl3.py:/opt/glm53/exl3.py:ro' \
         -v '/tmp/glm53-ablit:/opt/glm53/ablit:ro' \
         -v '/tmp/glm53-ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro' \
@@ -2136,6 +2144,7 @@ launch_cluster() {
         -v "$FLASHKDA_PATCH_HOST:/opt/glm53/patch_flashkda.py:ro" \
         -v "$FLASHKDA_IMPL_HOST:/opt/glm53/flashkda_impl.py:ro" \
         -v "$DEFAULT_TOKENS_PATCH_HOST:/opt/glm53/patch_default_max_new_tokens.py:ro" \
+        -v "$HOTPATH_PATCH_HOST:/opt/glm53/patch_glm_decode_hotpath.py:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/glm53/exl3.py:ro" \
         -v "$SCRIPT_DIR/ablit:/opt/glm53/ablit:ro" \
         -v "$SCRIPT_DIR/overlay/ablit_runtime.py:/opt/glm53/ablit_runtime.py:ro" \
