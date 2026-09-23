@@ -264,7 +264,9 @@ V3_WAITING_MAMBA_NEW = """                        num_new_tokens = self._mamba_b
 class _Glm53MixedPrefill:  # [glm53-decode-floor:v7]
     """Bound contention using completion feedback, without synchronizing GPUs."""
 
-    LADDER = (128, 256, 512, 768, 1024, 1536, 2048)
+    # 896 divides the 3584-token hit block, so contended prefill tiles a block
+    # in 4 steps instead of 768x4+512 (every prefill step pays ~0.35 s fixed).
+    LADDER = (128, 256, 512, 768, 896, 1024, 1536, 2048)
     COLD_TOK_S = 1300.0
     FIT_WINDOW = 24
 
@@ -839,6 +841,31 @@ class _Glm53MixedPrefill:  # [glm53-decode-floor:v7]
               f"missed={self.missed_prefill} timing=host_busy_proxy", flush=True)
 
     @staticmethod
+    def split_block_size(sched):
+        """Block the Mamba split aligns chunk ends to: the prefix-hit alignment.
+
+        Align-mode Mamba state is only written where a chunk ends, and a later
+        request can only reuse a prefix at a hit-aligned position. The
+        scheduler's cache_config.block_size is the 64-token kernel block here,
+        while hits align to the 3584-token hybrid block (fine-grained hits are
+        disabled by KpoolTail), so chunks of 7104 left no reusable state
+        anywhere inside a long cold prompt: re-sending an identical 35k prompt
+        recomputed 41% of it, and a 178k conversation was prefilled twice in
+        full 12 minutes apart. Align to the hit block when it is a multiple of
+        the scheduler block; otherwise (fine-grained hits on) keep stock.
+        Sub-block mixed caps still make progress: the cap is fed into the
+        split and re-aligns at the next boundary.
+        """
+        block = int(sched.cache_config.block_size)
+        try:
+            align = int(sched.kv_cache_manager.coordinator._cache_hit_alignment_tokens)
+        except Exception:
+            return block
+        if block > 0 and align > block and align % block == 0:
+            return align
+        return block
+
+    @staticmethod
     def tail_stop(sched, position):
         """Keep the Eagle last-cache-position stop only where a hit can land.
 
@@ -1270,16 +1297,24 @@ def unpatch_v6(text: str) -> str:
     return text
 
 
-# v7: v6 anchors with the marker advanced, plus the hit-aligned tail stop in
-# the Mamba split (the helper also changed: cost fit and progress floor).
+# v7: v6 anchors with the marker advanced, plus the hit-aligned tail stop and
+# the hit-aligned split block in the Mamba split (the helper also changed:
+# cost fit, progress floor, 896 ladder rung).
 TAIL_STOP_OLD = """            # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
 """
 TAIL_STOP_NEW = """            # Never run past the last cacheable block boundary mid-chunk.
             _GLM53_MIXED.tail_stop(self, last_cache_position),  # [glm53-decode-floor:v7]
 """
+SPLIT_BLOCK_OLD = """        block_size = self.cache_config.block_size
+        # The last block-aligned position whose state can be cached. With
+"""
+SPLIT_BLOCK_NEW = """        block_size = _GLM53_MIXED.split_block_size(self)  # [glm53-decode-floor:v7]
+        # The last block-aligned position whose state can be cached. With
+"""
 V7_PAIRS = tuple((new.replace(MARK_V6, MARK_V7), old, label) for new, old, label in V6_PAIRS) + (
     (TAIL_STOP_NEW, TAIL_STOP_OLD, "tail_stop"),
+    (SPLIT_BLOCK_NEW, SPLIT_BLOCK_OLD, "split_block"),
 )
 
 

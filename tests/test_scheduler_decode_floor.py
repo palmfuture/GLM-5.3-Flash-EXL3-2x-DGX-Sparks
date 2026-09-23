@@ -652,16 +652,29 @@ class TailStopTests(unittest.TestCase):
             _glm53_align_prefill_limit=None,
             kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(_cache_hit_alignment_tokens=align)))
 
-    def chunks(self, split, s, ctx, fresh):
+    def chunks(self, split, s, ctx, fresh, cap=None):
         r = SimpleNamespace(num_prompt_tokens=ctx + fresh, num_tokens=ctx + fresh,
                             num_computed_tokens=ctx, shared_prefix_boundary=0)
+        s._glm53_align_prefill_limit = cap
+        budget = s.max_num_scheduled_tokens if cap is None else min(cap, s.max_num_scheduled_tokens)
         out = []
         while r.num_computed_tokens < r.num_prompt_tokens:
-            n = split(s, r, min(r.num_prompt_tokens - r.num_computed_tokens, s.max_num_scheduled_tokens))
+            n = split(s, r, min(r.num_prompt_tokens - r.num_computed_tokens, budget))
             self.assertGreater(n, 0)
             out.append(n)
             r.num_computed_tokens += n
         return out
+
+    def assert_reusable(self, out, ctx, fresh, block=3584):
+        # Every chunk that is not the prompt's last must leave its Mamba state
+        # on a hit-aligned position, or no later request can reuse it.
+        pos = ctx
+        ends = []
+        for n in out[:-1]:
+            pos += n
+            ends.append(pos)
+        self.assertEqual(pos + out[-1], ctx + fresh)
+        return [e for e in ends if e % block]
 
     def test_unaligned_last_cache_position_no_longer_adds_a_tail_step(self):
         split, s, ctx = self.split_fn(), self.sched(), 21 * 3584
@@ -669,12 +682,52 @@ class TailStopTests(unittest.TestCase):
         self.assertEqual(self.chunks(split, s, ctx, 2524), [2524])
         self.assertEqual(self.chunks(split, s, ctx, 536), [536])
         self.assertEqual(self.chunks(split, s, ctx, 151), [151])
-        self.assertEqual(self.chunks(split, s, ctx, 32793)[-1], 32793 - 4 * 7104)
+        self.assertEqual(self.chunks(split, s, ctx, 3584 + 64), [3648])
 
-    def test_hit_aligned_last_cache_position_still_stops(self):
-        # prompt = ctx + 3584 + 64: last_cache_position = ctx + 3584 is hit-aligned.
+    def test_long_prompt_chunks_end_on_hit_blocks(self):
+        # Head-log shape: budget 7104 (MNBT 7168 minus 64 draft slots). v6
+        # ended chunks at 7104*k, never on a 3584 hit block, so an identical
+        # re-send recomputed 41% of a 35k prompt. Now every non-final chunk
+        # ends on a hit block; the Eagle stop keeps the last reusable one.
         split, s, ctx = self.split_fn(), self.sched(), 21 * 3584
-        self.assertEqual(self.chunks(split, s, ctx, 3584 + 64), [3584, 64])
+        for fresh in (32793, 35414, 178320):
+            out = self.chunks(split, s, ctx, fresh)
+            self.assertEqual(self.assert_reusable(out, ctx, fresh), [], (fresh, out))
+            self.assertTrue(all(n <= 7104 for n in out))
+        self.assertEqual(self.chunks(split, s, ctx, 32793), [3584] * 8 + [4121])
+        # From position 0 (no hit) as well.
+        out = self.chunks(split, s, 0, 35414)
+        self.assertEqual(self.assert_reusable(out, 0, 35414), [])
+
+    def test_budget_of_two_blocks_keeps_full_chunks(self):
+        # MNBT 7232 leaves a 7168 budget = two hit blocks: full-size chunks
+        # that still end on hit blocks.
+        split, s, ctx = self.split_fn(), self.sched(), 21 * 3584
+        s.max_num_scheduled_tokens = 7168
+        self.assertEqual(self.chunks(split, s, ctx, 32793), [7168] * 4 + [4121])
+        self.assertEqual(self.chunks(split, s, 0, 35414), [7168] * 4 + [6742])
+
+    def test_sub_block_mixed_caps_progress_and_realign(self):
+        # Fair-mode caps below the hit block must never round to zero
+        # (docs/astra-fix.md hazard) and must re-align at the next boundary.
+        split, s, ctx = self.split_fn(), self.sched(), 21 * 3584
+        for cap in (128, 256, 512, 768, 896, 1024, 2048):
+            out = self.chunks(split, s, ctx, 20000, cap=cap)
+            self.assertTrue(all(0 < n <= cap for n in out), (cap, out[:8]))
+            pos = ctx
+            for n in out:
+                # A sub-block chunk never runs past the next hit boundary.
+                self.assertEqual(pos // 3584, (pos + n - 1) // 3584, (cap, pos, n))
+                pos += n
+            self.assertEqual(pos, ctx + 20000)
+        self.assertEqual(self.chunks(split, s, ctx, 3584 * 2, cap=768)[:5], [768, 768, 768, 768, 512])
+        self.assertEqual(self.chunks(split, s, ctx, 3584 * 2, cap=896)[:4], [896] * 4)
+
+    def test_fine_grained_hits_keep_the_stock_block(self):
+        # Alignment 64 (fine-grained hits on) -> split stays on the 64 block.
+        split, ctx = self.split_fn(), 21 * 3584
+        s = self.sched(align=64)
+        self.assertEqual(self.chunks(split, s, ctx, 2524), [2432, 92])
 
     def test_without_alignment_info_keeps_stock_stop(self):
         split, ctx = self.split_fn(), 21 * 3584

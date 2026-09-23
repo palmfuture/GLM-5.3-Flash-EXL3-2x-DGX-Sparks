@@ -22,6 +22,12 @@ There were no git tags for 1.0.0–1.4.0; 1.5.0 is the first cut named as a rele
   progress floor (v6 starved contended prefills once the fitted fixed cost
   exceeded `GLM53_FAIR_PREFILL_MAX_STEP_MS`), and a hit-aligned Eagle tail
   stop that removes an extra 64-127 token prefill step from most requests.
+- Hit-aligned Mamba split block (scheduler v7): prefill chunks that do not
+  end the prompt now end on the 3584-token prefix-hit block instead of the
+  64-token kernel block, so long cold prompts leave reusable Mamba state (an
+  identical 35k re-send recomputed 41% before). `MAX_NUM_BATCHED_TOKENS`
+  7232 keeps solo chunks at 7168 (= 2 blocks after the 64 draft slots); the
+  fair ladder gains 896, which tiles a block in 4 steps.
 - Experimental TP2/SM121 KDA large-M BF16 prefill path
   (`GLM53_KDA_BF16_LARGE_M`, default `0`): uses retained FP8-derived BF16
   weights for scheduled M > 512, with approximately 3.26 GiB extra retained
